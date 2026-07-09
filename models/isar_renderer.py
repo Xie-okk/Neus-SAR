@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -181,6 +182,8 @@ class ISARRenderer:
         if torch.any(range_vals[1:] <= range_vals[:-1]):
             raise ValueError('range samples must be strictly ascending')
 
+        sdf_min = None
+        sdf_max = None
         image = torch.zeros(height, width, dtype=torch.float32, device=device)
         gradient_error_sum = torch.zeros([], dtype=torch.float32, device=device)
         gradient_error_count = torch.zeros([], dtype=torch.float32, device=device)
@@ -200,6 +203,12 @@ class ISARRenderer:
                 cos_anneal_ratio=cos_anneal_ratio
             )
             image = image + chunk_ret['image']
+            chunk_sdf = chunk_ret.get('sdf')
+            if chunk_sdf is not None:
+                chunk_min = torch.min(chunk_sdf)
+                chunk_max = torch.max(chunk_sdf)
+                sdf_min = chunk_min if sdf_min is None else torch.minimum(sdf_min, chunk_min)
+                sdf_max = chunk_max if sdf_max is None else torch.maximum(sdf_max, chunk_max)
             gradient_error_sum = gradient_error_sum + chunk_ret['gradient_error_sum']
             gradient_error_count = gradient_error_count + chunk_ret['gradient_error_count']
             debug_ret = chunk_ret
@@ -208,6 +217,9 @@ class ISARRenderer:
             image = self._apply_sinc_psf(image, frame_meta)
 
         # image = torch.sqrt(torch.clamp(image, min=0.0))
+        eps = 1e-6
+        image = torch.sqrt(torch.clamp(image, min=0.0) + eps) - np.sqrt(eps)
+
         image = image / (image.max().detach() + 1e-8)   # 归一化到 [0, 1]
 
         gradient_error = gradient_error_sum / (gradient_error_count + 1e-5)
@@ -215,6 +227,8 @@ class ISARRenderer:
         return {
             'isar': image,                 # 渲染的 ISAR 图像 (H, W)
             'sdf': debug_ret.get('sdf'),
+            'sdf_min': sdf_min,
+            'sdf_max': sdf_max,
             'points': debug_ret.get('points'),
             'gradients': debug_ret.get('gradients'),
             'normals': debug_ret.get('normals'),
@@ -279,7 +293,7 @@ class ISARRenderer:
         los = _meta_vector(frame_meta, 'radar_los').to(device)
         los = F.normalize(los, dim=0)
         incidence_cos = torch.clamp(torch.sum(normals * (los)[None, None, :], dim=-1, keepdim=True), min=0.0)
-        scatter = incidence_cos
+        scatter = incidence_cos ** 2
         point_weight = weights * scatter * ray_area
 
         points_flat = points.reshape(-1, 3)

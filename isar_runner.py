@@ -242,9 +242,9 @@ class ISARRunner:
             self.iter_step += 1
             with torch.no_grad():
                 # 既然你目前用的是官方原版（带有 * 10.0 的魔法），使用以下这行：
-                current_s = torch.exp(self.variance_network.variance * 10.0).item()
+                current_inv_s = torch.exp(self.variance_network.variance * 10.0).item()
                 # 如果你以后换回了你的纯净重构版（去掉了 * 10.0），请改为：
-                # current_s = torch.exp(self.variance_network.log_s).item()
+                # current_inv_s = torch.exp(self.variance_network.log_s).item()
             # -----------------------------
             # TensorBoard 记录
             self.writer.add_scalar('Loss/total', loss.item(), self.iter_step)
@@ -253,7 +253,7 @@ class ISARRunner:
             self.writer.add_scalar('LossRaw/image', image_loss_raw.item(), self.iter_step)
             self.writer.add_scalar('LossRaw/eikonal', eikonal_loss_raw.item(), self.iter_step)
             self.writer.add_scalar('Statistics/cos_anneal_ratio', cos_anneal_ratio, self.iter_step)
-            self.writer.add_scalar('Statistics/s', current_s, self.iter_step)
+            self.writer.add_scalar('Statistics/inv_s', current_inv_s, self.iter_step)
             self.writer.add_scalar('Statistics/n_height', self.renderer.n_height, self.iter_step)
 
             train_metrics = self.collect_train_metrics(
@@ -264,7 +264,7 @@ class ISARRunner:
                 image_loss_raw,
                 eikonal_loss_raw,
                 cos_anneal_ratio,
-                current_s,
+                current_inv_s,
                 target_image,
                 render_out
             )
@@ -275,7 +275,7 @@ class ISARRunner:
                       f"img_w={image_loss.item():.6f} eik_w={eikonal_loss.item():.6f} "
                       f"img_raw={image_loss_raw.item():.6f} eik_raw={eikonal_loss_raw.item():.6f} "
                       f"cos={cos_anneal_ratio:.3f} lr={self.optimizer.param_groups[0]['lr']:.2e} "
-                      f"s={current_s:.2f}") 
+                      f"inv_s={current_inv_s:.2f}") 
 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
@@ -499,12 +499,14 @@ class ISARRunner:
 
     def collect_train_metrics(self, frame_idx, loss, image_loss, eikonal_loss,
                               image_loss_raw, eikonal_loss_raw,
-                              cos_anneal_ratio, current_s, target_image, render_out):
+                              cos_anneal_ratio, current_inv_s, target_image, render_out):
         pred_image = render_out.get('isar')
         alpha = render_out.get('alpha')
         weights = render_out.get('weights')
         point_weight = render_out.get('point_weight')
         sdf = render_out.get('sdf')
+        sdf_min = render_out.get('sdf_min')
+        sdf_max = render_out.get('sdf_max')
         return {
             'iter': self.iter_step,
             'frame_idx': int(frame_idx),
@@ -516,7 +518,7 @@ class ISARRunner:
             'image_weight': float(self.image_weight),
             'igr_weight': float(self.igr_weight),
             'lr': float(self.optimizer.param_groups[0]['lr']),
-            'inv_s': float(current_s),
+            'inv_s': float(current_inv_s),
             'cos_anneal_ratio': float(cos_anneal_ratio),
             'n_height': self.renderer.n_height,
             'target_mean': self.tensor_stat(target_image, torch.mean),
@@ -529,8 +531,8 @@ class ISARRunner:
             'weight_max': self.tensor_stat(weights, torch.max),
             'point_weight_mean': self.tensor_stat(point_weight, torch.mean),
             'point_weight_max': self.tensor_stat(point_weight, torch.max),
-            'sdf_min': self.tensor_stat(sdf, torch.min),
-            'sdf_max': self.tensor_stat(sdf, torch.max),
+            'sdf_min': self.tensor_stat(sdf_min, torch.min),
+            'sdf_max': self.tensor_stat(sdf_max, torch.max),
         }
 
     def append_train_metrics(self, metrics):
@@ -555,27 +557,33 @@ class ISARRunner:
             return [float(row[name]) for row in rows]
 
         iters = [int(row['iter']) for row in rows]
-        fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+        fig, axes = plt.subplots(5, 1, figsize=(10, 15), sharex=True)
 
         axes[0].plot(iters, values('loss'), label='loss')
         axes[0].plot(iters, values('image_loss'), label='image_loss_weighted')
+        axes[0].plot(iters, values('eikonal_loss'), label='eikonal_loss_weighted')
         axes[0].set_ylabel('loss')
         axes[0].legend()
 
-        axes[1].plot(iters, values('eikonal_loss'), color='tab:green', label='eikonal_loss_weighted')
-        axes[1].set_ylabel('eikonal')
+        axes[1].plot(iters, values('image_loss'), color='tab:blue', label='image_loss_weighted')
+        axes[1].set_ylabel('image')
         axes[1].legend()
 
-        axes[2].plot(iters, values('inv_s'), color='tab:red', label='inv_s')
-        axes[2].set_ylabel('inv_s')
+        axes[2].plot(iters, values('eikonal_loss'), color='tab:green', label='eikonal_loss_weighted')
+        axes[2].set_ylabel('eikonal')
         axes[2].legend()
 
-        axes[3].plot(iters, values('sdf_min'), label='sdf_min')
-        axes[3].plot(iters, values('sdf_max'), label='sdf_max')
-        axes[3].axhline(0.0, color='black', linewidth=0.8, alpha=0.5)
-        axes[3].set_ylabel('sdf')
-        axes[3].set_xlabel('iter')
+        axes[3].plot(iters, values('inv_s'), color='tab:red', label='inv_s')
+        axes[3].set_ylabel('inv_s')
         axes[3].legend()
+
+        axes[4].plot(iters, values('sdf_min'), label='sdf_min')
+        axes[4].plot(iters, values('sdf_max'), label='sdf_max')
+        axes[4].axhline(0.0, color='black', linewidth=0.8, alpha=0.5)
+        axes[4].set_ylabel('sdf')
+        axes[4].set_xlabel('iter')
+        axes[4].legend()
+
 
         for ax in axes:
             ax.grid(True, alpha=0.3)
@@ -674,7 +682,10 @@ class ISARRunner:
         os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
         mesh_path = os.path.join(self.base_exp_dir, 'meshes',
                                  f'mesh_{self.iter_step:06d}.ply')
-        mesh = trimesh.Trimesh(vertices, triangles)
+        # 乘以放大倍数 coord_scale，将归一化空间坐标转换为物理空间（米）
+        vertices_scaled = vertices * self.renderer.coord_scale
+
+        mesh = trimesh.Trimesh(vertices_scaled, triangles)
         mesh.export(mesh_path)
         logging.info(f'Mesh saved to {mesh_path}')
         print(f"Mesh saved to {mesh_path} "
@@ -723,3 +734,4 @@ if __name__ == '__main__':
     elif args.mode == 'validate_mesh':
         mesh_resolution = args.mesh_resolution if args.mesh_resolution is not None else runner.get_mesh_resolution()
         runner.validate_mesh(resolution=mesh_resolution, threshold=args.mcube_threshold)
+
