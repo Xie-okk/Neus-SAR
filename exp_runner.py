@@ -13,8 +13,10 @@ from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
 from models.dataset import Dataset
+from models.isar_dataset import ISARDataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
+from models.isar_renderer import ISARRenderer
 
 
 class Runner:
@@ -367,10 +369,205 @@ class Runner:
         writer.release()
 
 
+class ISARRunner:
+    def __init__(self, conf_path, mode='train_isar', case='CASE_NAME', is_continue=False):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.conf_path = conf_path
+        with open(self.conf_path) as f:
+            conf_text = f.read()
+        conf_text = conf_text.replace('CASE_NAME', case)
+
+        self.conf = ConfigFactory.parse_string(conf_text)
+        self.conf['dataset.data_dir'] = self.conf['dataset.data_dir'].replace('CASE_NAME', case)
+        self.base_exp_dir = self.conf['general.base_exp_dir']
+        os.makedirs(self.base_exp_dir, exist_ok=True)
+        self.dataset = ISARDataset(self.conf['dataset'])
+        self.iter_step = 0
+
+        self.end_iter = self.conf.get_int('train.end_iter')
+        self.save_freq = self.conf.get_int('train.save_freq')
+        self.report_freq = self.conf.get_int('train.report_freq')
+        self.val_freq = self.conf.get_int('train.val_freq')
+        self.val_mesh_freq = self.conf.get_int('train.val_mesh_freq')
+        self.batch_size = self.conf.get_int('train.batch_size')
+        self.learning_rate = self.conf.get_float('train.learning_rate')
+        self.learning_rate_alpha = self.conf.get_float('train.learning_rate_alpha')
+        self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
+        self.image_weight = self.conf.get_float('train.image_weight', default=1.0)
+        self.igr_weight = self.conf.get_float('train.igr_weight', default=0.1)
+        self.is_continue = is_continue
+        self.mode = mode
+        self.writer = None
+
+        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
+        params_to_train = list(self.sdf_network.parameters())
+        self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
+        self.renderer = ISARRenderer(**self.conf['model.isar_renderer'])
+
+        latest_model_name = None
+        if is_continue:
+            checkpoint_dir = os.path.join(self.base_exp_dir, 'checkpoints')
+            if os.path.exists(checkpoint_dir):
+                model_list = []
+                for model_name in os.listdir(checkpoint_dir):
+                    if model_name[-3:] == 'pth' and int(model_name[5:-4]) <= self.end_iter:
+                        model_list.append(model_name)
+                model_list.sort()
+                if len(model_list) > 0:
+                    latest_model_name = model_list[-1]
+
+        if latest_model_name is not None:
+            logging.info('Find ISAR checkpoint: {}'.format(latest_model_name))
+            self.load_checkpoint(latest_model_name)
+
+        if self.mode[:5] == 'train':
+            self.file_backup()
+
+    def train(self):
+        self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
+        self.update_learning_rate()
+        res_step = self.end_iter - self.iter_step
+        image_perm = self.get_image_perm()
+
+        for iter_i in tqdm(range(res_step)):
+            frame_idx = int(image_perm[self.iter_step % len(image_perm)].detach().cpu().item())
+            bins, target_values, frame_meta = self.dataset.gen_random_bins_at(frame_idx, self.batch_size)
+            target_image, _ = self.dataset.get_frame(frame_idx)
+
+            render_out = self.renderer.render_bins(
+                frame_meta,
+                bins,
+                self.sdf_network,
+                image_shape=target_image.shape
+            )
+
+            image_loss = F.smooth_l1_loss(render_out['bin_values'], target_values)
+            eikonal_loss = render_out['gradient_error']
+            loss = image_loss * self.image_weight + \
+                   eikonal_loss * self.igr_weight
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            self.iter_step += 1
+            self.writer.add_scalar('Loss/loss', loss, self.iter_step)
+            self.writer.add_scalar('Loss/image_loss', image_loss, self.iter_step)
+            self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
+
+            if self.iter_step % self.report_freq == 0:
+                print(self.base_exp_dir)
+                print('iter:{:8>d} loss = {} lr={}'.format(
+                    self.iter_step, loss, self.optimizer.param_groups[0]['lr']
+                ))
+
+            if self.iter_step % self.save_freq == 0:
+                self.save_checkpoint()
+            if self.iter_step % self.val_freq == 0:
+                self.validate_image()
+            if self.iter_step % self.val_mesh_freq == 0:
+                self.validate_mesh()
+
+            self.update_learning_rate()
+            if self.iter_step % len(image_perm) == 0:
+                image_perm = self.get_image_perm()
+
+    def get_image_perm(self):
+        return torch.randperm(self.dataset.n_images)
+
+    def update_learning_rate(self):
+        if self.iter_step < self.warm_up_end and self.warm_up_end > 0:
+            learning_factor = self.iter_step / self.warm_up_end
+        else:
+            alpha = self.learning_rate_alpha
+            denom = max(1.0, self.end_iter - self.warm_up_end)
+            progress = (self.iter_step - self.warm_up_end) / denom
+            learning_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
+
+        for g in self.optimizer.param_groups:
+            g['lr'] = self.learning_rate * learning_factor
+
+    def file_backup(self):
+        dir_lis = self.conf['general.recording']
+        os.makedirs(os.path.join(self.base_exp_dir, 'recording'), exist_ok=True)
+        for dir_name in dir_lis:
+            cur_dir = os.path.join(self.base_exp_dir, 'recording', dir_name)
+            os.makedirs(cur_dir, exist_ok=True)
+            files = os.listdir(dir_name)
+            for f_name in files:
+                if f_name[-3:] == '.py':
+                    copyfile(os.path.join(dir_name, f_name), os.path.join(cur_dir, f_name))
+
+        copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
+
+    def load_checkpoint(self, checkpoint_name):
+        checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device)
+        self.sdf_network.load_state_dict(checkpoint['sdf_network'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.iter_step = checkpoint['iter_step']
+        logging.info('End')
+
+    def save_checkpoint(self):
+        checkpoint = {
+            'sdf_network': self.sdf_network.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'iter_step': self.iter_step,
+        }
+
+        os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
+        torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
+
+    def validate_image(self, idx=-1):
+        if idx < 0:
+            idx = np.random.randint(self.dataset.n_images)
+
+        print('Validate ISAR: iter: {}, frame: {}'.format(self.iter_step, idx))
+        target_image, frame_meta = self.dataset.get_frame(idx)
+        render_out = self.renderer.render_frame(
+            frame_meta,
+            self.sdf_network,
+            image_shape=target_image.shape
+        )
+
+        pred = render_out['isar'].detach().cpu().numpy()
+        target = target_image.detach().cpu().numpy()
+
+        def to_u8(image):
+            image = image - image.min()
+            image = image / (image.max() + 1e-8)
+            return (image * 255.0).clip(0, 255).astype(np.uint8)
+
+        os.makedirs(os.path.join(self.base_exp_dir, 'validations_isar'), exist_ok=True)
+        cv.imwrite(
+            os.path.join(self.base_exp_dir, 'validations_isar', '{:0>8d}_{}.png'.format(self.iter_step, idx)),
+            np.concatenate([to_u8(target), to_u8(pred)], axis=1)
+        )
+
+    def validate_mesh(self, resolution=256, threshold=0.0):
+        bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32, device=self.device)
+        bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32, device=self.device)
+        vertices, triangles = self.renderer.extract_geometry(
+            self.sdf_network,
+            bound_min,
+            bound_max,
+            resolution=resolution,
+            threshold=threshold
+        )
+
+        os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
+        mesh = trimesh.Trimesh(vertices, triangles)
+        mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}.ply'.format(self.iter_step)))
+        logging.info('End')
+
+
 if __name__ == '__main__':
     print('Hello Wooden')
 
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    if torch.cuda.is_available():
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    else:
+        torch.set_default_tensor_type('torch.FloatTensor')
 
     FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)
@@ -385,15 +582,27 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    torch.cuda.set_device(args.gpu)
-    runner = Runner(args.conf, args.mode, args.case, args.is_continue)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
 
-    if args.mode == 'train':
+    if args.mode == 'train_isar':
+        runner = ISARRunner(args.conf, args.mode, args.case, args.is_continue)
         runner.train()
-    elif args.mode == 'validate_mesh':
-        runner.validate_mesh(world_space=True, resolution=256, threshold=args.mcube_threshold)
-    elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
-        _, img_idx_0, img_idx_1 = args.mode.split('_')
-        img_idx_0 = int(img_idx_0)
-        img_idx_1 = int(img_idx_1)
-        runner.interpolate_view(img_idx_0, img_idx_1)
+    elif args.mode == 'validate_isar_mesh':
+        runner = ISARRunner(args.conf, args.mode, args.case, args.is_continue)
+        runner.validate_mesh(resolution=256, threshold=args.mcube_threshold)
+    elif args.mode == 'validate_isar_image':
+        runner = ISARRunner(args.conf, args.mode, args.case, args.is_continue)
+        runner.validate_image()
+    else:
+        runner = Runner(args.conf, args.mode, args.case, args.is_continue)
+
+        if args.mode == 'train':
+            runner.train()
+        elif args.mode == 'validate_mesh':
+            runner.validate_mesh(world_space=True, resolution=256, threshold=args.mcube_threshold)
+        elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
+            _, img_idx_0, img_idx_1 = args.mode.split('_')
+            img_idx_0 = int(img_idx_0)
+            img_idx_1 = int(img_idx_1)
+            runner.interpolate_view(img_idx_0, img_idx_1)

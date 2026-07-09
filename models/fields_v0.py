@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +5,7 @@ import numpy as np
 from models.embedder import get_embedder
 
 
-# SDF Network: This implementation is borrowed from IDR
+# This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class SDFNetwork(nn.Module):
     def __init__(self,
                  d_in,
@@ -19,16 +18,10 @@ class SDFNetwork(nn.Module):
                  scale=1,
                  geometric_init=True,
                  weight_norm=True,
-                 init_ellipsoid_scale=(1.0, 1.0, 1.0),
                  inside_outside=False):
         super(SDFNetwork, self).__init__()
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
-        init_ellipsoid_scale = torch.tensor(init_ellipsoid_scale, dtype=torch.float32)
-        if init_ellipsoid_scale.numel() != 3:
-            raise ValueError('init_ellipsoid_scale must contain exactly 3 values')
-        if torch.any(init_ellipsoid_scale <= 0):
-            raise ValueError('init_ellipsoid_scale values must be positive')
 
         self.embed_fn_fine = None
 
@@ -61,18 +54,13 @@ class SDFNetwork(nn.Module):
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
                     torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                    lin.weight.data[:, :3] /= init_ellipsoid_scale.to(lin.weight.device)
                 elif multires > 0 and l in self.skip_in:
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
                     torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3):], 0.0)
-                    skip_input_start = lin.weight.shape[1] - dims[0]
-                    lin.weight.data[:, skip_input_start:skip_input_start + 3] /= init_ellipsoid_scale.to(lin.weight.device)
                 else:
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                    if l == 0:
-                        lin.weight.data[:, :3] /= init_ellipsoid_scale.to(lin.weight.device)
 
             if weight_norm:
                 lin = nn.utils.weight_norm(lin)
@@ -106,7 +94,6 @@ class SDFNetwork(nn.Module):
         return self.forward(x)
 
     def gradient(self, x):
-        # 计算空间导数，用于获取表面法线和约束 Eikonal Loss
         x.requires_grad_(True)
         y = self.sdf(x)
         d_output = torch.ones_like(y, requires_grad=False, device=y.device)
@@ -118,6 +105,7 @@ class SDFNetwork(nn.Module):
             retain_graph=True,
             only_inputs=True)[0]
         return gradients.unsqueeze(1)
+
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class RenderingNetwork(nn.Module):
@@ -264,16 +252,12 @@ class NeRF(nn.Module):
             return alpha, rgb
         else:
             assert False
-            
+
 
 class SingleVarianceNetwork(nn.Module):
-    """
-    NeuS Variance Network 
-    """
     def __init__(self, init_val):
         super(SingleVarianceNetwork, self).__init__()
         self.register_parameter('variance', nn.Parameter(torch.tensor(init_val)))
 
     def forward(self, x):
-        return torch.ones([len(x), 1], device=self.variance.device) * torch.exp(self.variance * 10.0)
-
+        return torch.ones([len(x), 1]) * torch.exp(self.variance * 10.0)
