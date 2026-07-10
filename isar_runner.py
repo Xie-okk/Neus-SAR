@@ -122,6 +122,10 @@ class ISARRunner:
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.image_weight = self.conf.get_float('train.image_weight', default=1.0)
         self.igr_weight = self.conf.get_float('train.igr_weight', default=0.1)
+        self.inside_weight = self.conf.get_float('train.inside_weight', default=0.0)
+        self.inside_margin = self.conf.get_float('train.inside_margin', default=0.02)
+        self.inside_core_scale = self.conf.get_float('train.inside_core_scale', default=0.35)
+        self.inside_num_points = self.conf.get_int('train.inside_num_points', default=1024)
         self.export_init_mesh = self.conf.get_bool('validate.export_init_mesh', default=True)
         self.export_init_image = self.conf.get_bool('validate.export_init_image', default=False)
         self.export_init_sdf = self.conf.get_bool('validate.export_init_sdf', default=True)
@@ -235,9 +239,11 @@ class ISARRunner:
             image_loss_raw = F.l1_loss(pred_image_norm, target_image_norm)
             
             eikonal_loss_raw = render_out['gradient_error']
+            inside_loss_raw = self.compute_inside_loss()
             image_loss = self.image_weight * image_loss_raw
             eikonal_loss = self.igr_weight * eikonal_loss_raw
-            loss = image_loss + eikonal_loss
+            inside_loss = self.inside_weight * inside_loss_raw
+            loss = image_loss + eikonal_loss + inside_loss
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -254,8 +260,10 @@ class ISARRunner:
             self.writer.add_scalar('Loss/total', loss.item(), self.iter_step)
             self.writer.add_scalar('Loss/image', image_loss.item(), self.iter_step)
             self.writer.add_scalar('Loss/eikonal', eikonal_loss.item(), self.iter_step)
+            self.writer.add_scalar('Loss/inside', inside_loss.item(), self.iter_step)
             self.writer.add_scalar('LossRaw/image', image_loss_raw.item(), self.iter_step)
             self.writer.add_scalar('LossRaw/eikonal', eikonal_loss_raw.item(), self.iter_step)
+            self.writer.add_scalar('LossRaw/inside', inside_loss_raw.item(), self.iter_step)
             self.writer.add_scalar('Statistics/cos_anneal_ratio', cos_anneal_ratio, self.iter_step)
             self.writer.add_scalar('Statistics/inv_s', current_inv_s, self.iter_step)
             self.writer.add_scalar('Statistics/n_height', self.renderer.n_height, self.iter_step)
@@ -265,8 +273,10 @@ class ISARRunner:
                 loss,
                 image_loss,
                 eikonal_loss,
+                inside_loss,
                 image_loss_raw,
                 eikonal_loss_raw,
+                inside_loss_raw,
                 cos_anneal_ratio,
                 current_inv_s,
                 target_image,
@@ -277,7 +287,9 @@ class ISARRunner:
             if self.iter_step % self.report_freq == 0:
                 print(f"[iter {self.iter_step}] loss={loss.item():.6f} "
                       f"img_w={image_loss.item():.6f} eik_w={eikonal_loss.item():.6f} "
+                      f"inside_w={inside_loss.item():.6f} "
                       f"img_raw={image_loss_raw.item():.6f} eik_raw={eikonal_loss_raw.item():.6f} "
+                      f"inside_raw={inside_loss_raw.item():.6f} "
                       f"cos={cos_anneal_ratio:.3f} lr={self.optimizer.param_groups[0]['lr']:.2e} "
                       f"inv_s={current_inv_s:.2f}") 
 
@@ -367,6 +379,27 @@ class ISARRunner:
 
     def get_image_perm(self):
         return torch.randperm(self.dataset.n_images)
+
+    def compute_inside_loss(self):
+        if self.inside_weight <= 0.0 or self.inside_num_points <= 0:
+            return torch.zeros([], dtype=torch.float32, device=self.device)
+        if not getattr(self.sdf_network, 'use_ellipsoid_residual', False):
+            return torch.zeros([], dtype=torch.float32, device=self.device)
+
+        radius = self.sdf_network.get_ellipsoid_radius().detach().to(self.device)
+        center = self.sdf_network.ellipsoid_center.detach().to(self.device)
+        if torch.any(radius <= 0.0):
+            return torch.zeros([], dtype=torch.float32, device=self.device)
+
+        n_points = int(self.inside_num_points)
+        dirs = torch.randn(n_points, 3, device=self.device)
+        dirs = F.normalize(dirs, dim=-1)
+        radii = torch.rand(n_points, 1, device=self.device).pow(1.0 / 3.0)
+        core_scale = max(0.0, float(self.inside_core_scale))
+        points = center[None, :] + dirs * radii * core_scale * radius[None, :]
+
+        sdf = self.sdf_network.sdf(points)
+        return F.relu(sdf + self.inside_margin).mean()
 
     def update_learning_rate(self):
         if self.iter_step < self.warm_up_end and self.warm_up_end > 0:
@@ -463,8 +496,9 @@ class ISARRunner:
 
     def metric_fieldnames(self):
         return [
-            'iter', 'frame_idx', 'loss', 'image_loss', 'eikonal_loss',
-            'image_loss_raw', 'eikonal_loss_raw', 'image_weight', 'igr_weight',
+            'iter', 'frame_idx', 'loss', 'image_loss', 'eikonal_loss', 'inside_loss',
+            'image_loss_raw', 'eikonal_loss_raw', 'inside_loss_raw',
+            'image_weight', 'igr_weight', 'inside_weight',
             'lr', 'inv_s', 'cos_anneal_ratio', 'n_height',
             'target_mean', 'target_max', 'pred_mean', 'pred_max',
             'alpha_mean', 'alpha_max', 'weight_mean', 'weight_max',
@@ -501,8 +535,8 @@ class ISARRunner:
             return float('nan')
         return float(reducer(tensor.detach()).item())
 
-    def collect_train_metrics(self, frame_idx, loss, image_loss, eikonal_loss,
-                              image_loss_raw, eikonal_loss_raw,
+    def collect_train_metrics(self, frame_idx, loss, image_loss, eikonal_loss, inside_loss,
+                              image_loss_raw, eikonal_loss_raw, inside_loss_raw,
                               cos_anneal_ratio, current_inv_s, target_image, render_out):
         pred_image = render_out.get('isar')
         alpha = render_out.get('alpha')
@@ -517,10 +551,13 @@ class ISARRunner:
             'loss': float(loss.detach().item()),
             'image_loss': float(image_loss.detach().item()),
             'eikonal_loss': float(eikonal_loss.detach().item()),
+            'inside_loss': float(inside_loss.detach().item()),
             'image_loss_raw': float(image_loss_raw.detach().item()),
             'eikonal_loss_raw': float(eikonal_loss_raw.detach().item()),
+            'inside_loss_raw': float(inside_loss_raw.detach().item()),
             'image_weight': float(self.image_weight),
             'igr_weight': float(self.igr_weight),
+            'inside_weight': float(self.inside_weight),
             'lr': float(self.optimizer.param_groups[0]['lr']),
             'inv_s': float(current_inv_s),
             'cos_anneal_ratio': float(cos_anneal_ratio),
@@ -566,6 +603,8 @@ class ISARRunner:
         axes[0].plot(iters, values('loss'), label='loss')
         axes[0].plot(iters, values('image_loss'), label='image_loss_weighted')
         axes[0].plot(iters, values('eikonal_loss'), label='eikonal_loss_weighted')
+        if 'inside_loss' in rows[0]:
+            axes[0].plot(iters, values('inside_loss'), label='inside_loss_weighted')
         axes[0].set_ylabel('loss')
         axes[0].legend()
 
