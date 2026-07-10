@@ -220,7 +220,7 @@ class ISARRenderer:
         eps = 1e-6
         image = torch.sqrt(torch.clamp(image, min=0.0) + eps) - np.sqrt(eps)
 
-        image = image / (image.max().detach() + 1e-8)   # normalize to [0, 1] for visualization/output
+        # image = image / (image.max().detach() + 1e-8)   # normalize to [0, 1] for visualization/output
 
         gradient_error = gradient_error_sum / (gradient_error_count + 1e-5)
 

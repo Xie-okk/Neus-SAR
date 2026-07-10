@@ -601,7 +601,13 @@ class ISARRunner:
 
     # ===================== 验证 =====================
     def _normalize_validation_image(self, img):
-        return (np.clip(img, 0.0, 1.0) * 255).astype(np.uint8)
+        img = np.asarray(img, dtype=np.float32)
+        img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+        img = np.clip(img, 0.0, None)
+        vmax = np.max(img)
+        if vmax <= 1e-8:
+            return np.zeros_like(img, dtype=np.uint8)
+        return (np.clip(img / vmax, 0.0, 1.0) * 255).astype(np.uint8)
 
     def _render_validation_pair(self, idx):
         target_image, frame_meta = self.dataset.get_frame(idx)
