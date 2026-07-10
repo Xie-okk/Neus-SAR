@@ -229,7 +229,11 @@ class ISARRunner:
                 cos_anneal_ratio=cos_anneal_ratio
             )
 
-            image_loss_raw = F.l1_loss(render_out['isar'], target_image)
+            pred_image = render_out['isar']
+            pred_image_norm = pred_image / (pred_image.mean().detach() + 1e-6)
+            target_image_norm = target_image / (target_image.mean().detach() + 1e-6)
+            image_loss_raw = F.l1_loss(pred_image_norm, target_image_norm)
+            
             eikonal_loss_raw = render_out['gradient_error']
             image_loss = self.image_weight * image_loss_raw
             eikonal_loss = self.igr_weight * eikonal_loss_raw

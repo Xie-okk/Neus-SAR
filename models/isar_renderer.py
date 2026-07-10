@@ -216,11 +216,11 @@ class ISARRenderer:
         if self.splat_mode == 3:
             image = self._apply_sinc_psf(image, frame_meta)
 
-        # image = torch.sqrt(torch.clamp(image, min=0.0))
+        
         eps = 1e-6
         image = torch.sqrt(torch.clamp(image, min=0.0) + eps) - np.sqrt(eps)
 
-        image = image / (image.max().detach() + 1e-8)   # 归一化到 [0, 1]
+        image = image / (image.max().detach() + 1e-8)   # normalize to [0, 1] for visualization/output
 
         gradient_error = gradient_error_sum / (gradient_error_count + 1e-5)
 
