@@ -18,7 +18,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from models.isar_dataset import ISARDataset
-from models.fields import ISARNeRFNetwork, SDFNetwork, SingleVarianceNetwork
+from models.fields import SDFNetwork, SingleVarianceNetwork
 from models.isar_renderer import ISARRenderer
 
 warnings.filterwarnings(
@@ -68,29 +68,6 @@ def plot_sdf_z_plane(sdf_network, device, resolution=100, output_path='sdf_z0.pn
     print(f"SDF z=0 plane saved to {output_path}")
     plt.close()
 
-def plot_density_z_plane(nerf_network, device, resolution=100, output_path='density_z0.png'):
-    x = np.linspace(-1, 1, resolution)
-    y = np.linspace(-1, 1, resolution)
-    X, Y = np.meshgrid(x, y)
-    pts = np.stack([X.flatten(), Y.flatten(), np.zeros_like(X).flatten()], axis=-1)
-    pts_tensor = torch.tensor(pts, dtype=torch.float32, device=device)
-    with torch.no_grad():
-        density = nerf_network.density(pts_tensor).cpu().numpy().reshape(resolution, resolution)
-
-    plt.figure(figsize=(7, 6))
-    image = plt.imshow(density, extent=[-1, 1, -1, 1], origin='lower', cmap='viridis')
-    plt.colorbar(image, label='Density')
-    plt.title('NeRF density cross-section at Z=0')
-    plt.xlabel('X')
-    plt.ylabel('Y')
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    plt.savefig(output_path)
-    print(f"NeRF density z=0 plane saved to {output_path}")
-    plt.close()
-
-
 def parse_view_ids(view_ids, n_images):
     if view_ids.lower() == 'all':
         return list(range(n_images))
@@ -120,9 +97,6 @@ class ISARRunner:
         conf_text = conf_text.replace('CASE_NAME', case)
         self.conf = ConfigFactory.parse_string(conf_text)
         self.conf['dataset.data_dir'] = self.conf['dataset.data_dir'].replace('CASE_NAME', case)
-        self.model_type = self.conf.get_string('model.type', default='neus').lower()
-        if self.model_type not in ('neus', 'nerf'):
-            raise ValueError("model.type must be 'neus' or 'nerf'")
         self.seed = self.conf.get_int('train.seed', default=20240708)
         self.set_random_seed(self.seed)
 
@@ -159,7 +133,6 @@ class ISARRunner:
         self.export_final_sdf = self.conf.get_bool('validate.export_final_sdf', default=True)
         self.export_final_mesh = self.conf.get_bool('validate.export_final_mesh', default=False)
         self.mesh_resolution = self.conf.get_int('validate.mesh_resolution', default=64)
-        self.nerf_density_threshold = self.conf.get_float('validate.nerf_density_threshold', default=1.0)
         self.final_results_saved = False
         self.checkpoint_name = checkpoint_name
         self.is_continue = is_continue or checkpoint_name is not None
@@ -170,18 +143,15 @@ class ISARRunner:
         self.validate_n_height = self.get_optional_int('validate.n_height', default=None)
 
         # 初始化网络
-        self.sdf_network = None
-        self.variance_network = None
-        self.nerf_network = None
-        if self.model_type == 'neus':
-            self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
-            self.variance_network = SingleVarianceNetwork(
-                init_val=self.conf.get_float('model.variance_network.init_val', 50.0)
-            ).to(self.device)
-            params_to_train = list(self.sdf_network.parameters()) + list(self.variance_network.parameters())
-        else:
-            self.nerf_network = ISARNeRFNetwork(**self.conf['model.nerf_network']).to(self.device)
-            params_to_train = list(self.nerf_network.parameters())
+        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
+
+        self.variance_network = SingleVarianceNetwork(
+            init_val=self.conf.get_float('model.variance_network.init_val', 50.0)
+        ).to(self.device)
+
+        # 优化器
+        params_to_train = list(self.sdf_network.parameters()) + \
+                          list(self.variance_network.parameters())
         self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
 
         # 渲染器（使用我们最终极简版本）
@@ -227,21 +197,6 @@ class ISARRunner:
             torch.cuda.manual_seed_all(seed)
         print(f'Random seed set to {seed}')
     # ===================== 训练 =====================
-    def render_isar(self, frame_meta, image_shape, cos_anneal_ratio=1.0):
-        if self.model_type == 'neus':
-            return self.renderer.render_frame(
-                frame_meta,
-                self.sdf_network,
-                self.variance_network,
-                image_shape=image_shape,
-                cos_anneal_ratio=cos_anneal_ratio
-            )
-        return self.renderer.render_frame_nerf(
-            frame_meta,
-            self.nerf_network,
-            image_shape=image_shape
-        )
-
     def train(self):
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
         self.init_metrics_log()
@@ -269,8 +224,12 @@ class ISARRunner:
             target_image, frame_meta = self.dataset.get_frame(frame_idx)
             cos_anneal_ratio = self.get_cos_anneal_ratio()
 
-            render_out = self.render_isar(
-                frame_meta, target_image.shape, cos_anneal_ratio=cos_anneal_ratio
+            render_out = self.renderer.render_frame(
+                frame_meta,
+                self.sdf_network,
+                self.variance_network,
+                image_shape=target_image.shape,
+                cos_anneal_ratio=cos_anneal_ratio
             )
 
             pred_image = render_out['isar']
@@ -278,7 +237,7 @@ class ISARRunner:
             target_image_norm = target_image / (target_image.mean().detach() + 1e-6)
             image_loss_raw = self.compute_image_loss(pred_image_norm, target_image_norm)
             
-            eikonal_loss_raw = render_out['gradient_error'] if self.model_type == 'neus' else torch.zeros([], device=self.device)
+            eikonal_loss_raw = render_out['gradient_error']
             image_loss = self.image_weight * image_loss_raw
             eikonal_loss = self.igr_weight * eikonal_loss_raw
             loss = image_loss + eikonal_loss
@@ -290,10 +249,7 @@ class ISARRunner:
             self.iter_step += 1
             with torch.no_grad():
                 # 既然你目前用的是官方原版（带有 * 10.0 的魔法），使用以下这行：
-                current_inv_s = (
-                    torch.exp(self.variance_network.variance * 10.0).item()
-                    if self.model_type == 'neus' else float('nan')
-                )
+                current_inv_s = torch.exp(self.variance_network.variance * 10.0).item()
                 # 如果你以后换回了你的纯净重构版（去掉了 * 10.0），请改为：
                 # current_inv_s = torch.exp(self.variance_network.log_s).item()
             # -----------------------------
@@ -505,31 +461,19 @@ class ISARRunner:
         else:
             path = os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name)
         checkpoint = torch.load(path, map_location=self.device)
-        checkpoint_model_type = checkpoint.get('model_type', 'neus')
-        if checkpoint_model_type != self.model_type:
-            raise ValueError(
-                f'Checkpoint model type {checkpoint_model_type!r} does not match {self.model_type!r}'
-            )
-        if self.model_type == 'neus':
-            self.sdf_network.load_state_dict(checkpoint['sdf_network'])
-            self.variance_network.load_state_dict(checkpoint['variance_network'])
-        else:
-            self.nerf_network.load_state_dict(checkpoint['nerf_network'])
+        self.sdf_network.load_state_dict(checkpoint['sdf_network'])
+        self.variance_network.load_state_dict(checkpoint['variance_network'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.iter_step = checkpoint['iter_step']
         logging.info(f'Checkpoint loaded (iter {self.iter_step})')
 
     def save_checkpoint(self):
         checkpoint = {
-            'model_type': self.model_type,
+            'sdf_network': self.sdf_network.state_dict(),
+            'variance_network': self.variance_network.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'iter_step': self.iter_step,
         }
-        if self.model_type == 'neus':
-            checkpoint['sdf_network'] = self.sdf_network.state_dict()
-            checkpoint['variance_network'] = self.variance_network.state_dict()
-        else:
-            checkpoint['nerf_network'] = self.nerf_network.state_dict()
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
         path = os.path.join(self.base_exp_dir, 'checkpoints',
                             f'ckpt_{self.iter_step:06d}.pth')
@@ -537,13 +481,12 @@ class ISARRunner:
 
     def metric_fieldnames(self):
         return [
-            'iter', 'frame_idx', 'model_type', 'loss', 'image_loss', 'eikonal_loss',
+            'iter', 'frame_idx', 'loss', 'image_loss', 'eikonal_loss',
             'image_loss_raw', 'eikonal_loss_raw', 'image_weight', 'igr_weight',
             'lr', 'inv_s', 'cos_anneal_ratio', 'n_height',
             'target_mean', 'target_max', 'pred_mean', 'pred_max',
             'alpha_mean', 'alpha_max', 'weight_mean', 'weight_max',
-            'point_weight_mean', 'point_weight_max', 'sdf_min', 'sdf_max',
-            'density_min', 'density_max'
+            'point_weight_mean', 'point_weight_max', 'sdf_min', 'sdf_max'
         ]
 
     def init_metrics_log(self):
@@ -583,14 +526,12 @@ class ISARRunner:
         alpha = render_out.get('alpha')
         weights = render_out.get('weights')
         point_weight = render_out.get('point_weight')
+        sdf = render_out.get('sdf')
         sdf_min = render_out.get('sdf_min')
         sdf_max = render_out.get('sdf_max')
-        density_min = render_out.get('density_min')
-        density_max = render_out.get('density_max')
         return {
             'iter': self.iter_step,
             'frame_idx': int(frame_idx),
-            'model_type': self.model_type,
             'loss': float(loss.detach().item()),
             'image_loss': float(image_loss.detach().item()),
             'eikonal_loss': float(eikonal_loss.detach().item()),
@@ -614,8 +555,6 @@ class ISARRunner:
             'point_weight_max': self.tensor_stat(point_weight, torch.max),
             'sdf_min': self.tensor_stat(sdf_min, torch.min),
             'sdf_max': self.tensor_stat(sdf_max, torch.max),
-            'density_min': self.tensor_stat(density_min, torch.min),
-            'density_max': self.tensor_stat(density_max, torch.max),
         }
 
     def append_train_metrics(self, metrics):
@@ -656,20 +595,14 @@ class ISARRunner:
         axes[2].set_ylabel('eikonal')
         axes[2].legend()
 
-        if self.model_type == 'neus':
-            axes[3].plot(iters, values('inv_s'), color='tab:red', label='inv_s')
-            axes[3].set_ylabel('inv_s')
-            axes[4].plot(iters, values('sdf_min'), label='sdf_min')
-            axes[4].plot(iters, values('sdf_max'), label='sdf_max')
-            axes[4].axhline(0.0, color='black', linewidth=0.8, alpha=0.5)
-            axes[4].set_ylabel('sdf')
-        else:
-            axes[3].plot(iters, values('weight_mean'), color='tab:red', label='weight_mean')
-            axes[3].set_ylabel('weight')
-            axes[4].plot(iters, values('density_min'), label='density_min')
-            axes[4].plot(iters, values('density_max'), label='density_max')
-            axes[4].set_ylabel('density')
+        axes[3].plot(iters, values('inv_s'), color='tab:red', label='inv_s')
+        axes[3].set_ylabel('inv_s')
         axes[3].legend()
+
+        axes[4].plot(iters, values('sdf_min'), label='sdf_min')
+        axes[4].plot(iters, values('sdf_max'), label='sdf_max')
+        axes[4].axhline(0.0, color='black', linewidth=0.8, alpha=0.5)
+        axes[4].set_ylabel('sdf')
         axes[4].set_xlabel('iter')
         axes[4].legend()
 
@@ -696,7 +629,12 @@ class ISARRunner:
 
     def _render_validation_pair(self, idx):
         target_image, frame_meta = self.dataset.get_frame(idx)
-        render_out = self.render_isar(frame_meta, target_image.shape)
+        render_out = self.renderer.render_frame(
+            frame_meta,
+            self.sdf_network,
+            self.variance_network,
+            image_shape=target_image.shape
+        )
 
         pred = render_out['isar'].detach().cpu().numpy()
         target = target_image.detach().cpu().numpy()
@@ -751,39 +689,23 @@ class ISARRunner:
         print(f"Validation views saved to {out_path}")
 
     def validate_sdf_z_plane(self):
-        if self.model_type == 'neus':
-            field_path = os.path.join(
-                self.base_exp_dir,
-                'sdf_z_planes',
-                f'sdf_z0_{self.iter_step:06d}.png'
-            )
-            plot_sdf_z_plane(self.sdf_network, self.device, output_path=field_path)
-        else:
-            field_path = os.path.join(
-                self.base_exp_dir,
-                'density_z_planes',
-                f'density_z0_{self.iter_step:06d}.png'
-            )
-            plot_density_z_plane(self.nerf_network, self.device, output_path=field_path)
+        sdf_plane_path = os.path.join(
+            self.base_exp_dir,
+            'sdf_z_planes',
+            f'sdf_z0_{self.iter_step:06d}.png'
+        )
+        plot_sdf_z_plane(self.sdf_network, self.device, output_path=sdf_plane_path)
 
     def validate_mesh(self, resolution=256, threshold=0.0):
-        if self.model_type == 'nerf' and threshold == 0.0:
-            threshold = self.nerf_density_threshold
         print(f"Extracting mesh at iter {self.iter_step} "
               f"(resolution={resolution}, threshold={threshold})...")
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32, device=self.device)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32, device=self.device)
 
-        if self.model_type == 'neus':
-            vertices, triangles = self.renderer.extract_geometry(
-                self.sdf_network, bound_min, bound_max,
-                resolution=resolution, threshold=threshold
-            )
-        else:
-            vertices, triangles = self.renderer.extract_density_geometry(
-                self.nerf_network, bound_min, bound_max,
-                resolution=resolution, threshold=threshold
-            )
+        vertices, triangles = self.renderer.extract_geometry(
+            self.sdf_network, bound_min, bound_max,
+            resolution=resolution, threshold=threshold
+        )
 
         os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
         mesh_path = os.path.join(self.base_exp_dir, 'meshes',
@@ -840,3 +762,4 @@ if __name__ == '__main__':
     elif args.mode == 'validate_mesh':
         mesh_resolution = args.mesh_resolution if args.mesh_resolution is not None else runner.get_mesh_resolution()
         runner.validate_mesh(resolution=mesh_resolution, threshold=args.mcube_threshold)
+

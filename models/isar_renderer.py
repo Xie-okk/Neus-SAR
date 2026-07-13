@@ -244,97 +244,6 @@ class ISARRenderer:
             'gradient_error': gradient_error,
         }
 
-    def render_frame_nerf(self, frame_meta, nerf_network, image_shape=None, n_samples=None):
-        device = next(nerf_network.parameters()).device
-        if image_shape is None:
-            range_axis = frame_meta['range_axis']
-            azimuth_axis = frame_meta['azimuth_axis']
-            height, width = range_axis.shape[0], azimuth_axis.shape[0]
-        else:
-            height, width = image_shape
-
-        ray_bases, ray_dir, range_vals, ray_area = self.generate_parallel_rays(
-            frame_meta, (height, width), device, n_samples
-        )
-        if torch.any(range_vals[1:] <= range_vals[:-1]):
-            raise ValueError('range samples must be strictly ascending')
-
-        density_min = None
-        density_max = None
-        image = torch.zeros(height, width, dtype=torch.float32, device=device)
-        debug_ret = {}
-        for start in range(0, ray_bases.shape[0], self.ray_chunk):
-            end = min(start + self.ray_chunk, ray_bases.shape[0])
-            chunk_ret = self.render_ray_chunk_nerf(
-                ray_bases[start:end], ray_dir, range_vals, ray_area, frame_meta,
-                nerf_network, (height, width)
-            )
-            image = image + chunk_ret['image']
-            chunk_density = chunk_ret['density']
-            chunk_min = torch.min(chunk_density)
-            chunk_max = torch.max(chunk_density)
-            density_min = chunk_min if density_min is None else torch.minimum(density_min, chunk_min)
-            density_max = chunk_max if density_max is None else torch.maximum(density_max, chunk_max)
-            debug_ret = chunk_ret
-
-        if self.splat_mode == 3:
-            image = self._apply_sinc_psf(image, frame_meta)
-        image = torch.sqrt(torch.clamp(image, min=0.0) + 1e-6) - np.sqrt(1e-6)
-
-        return {
-            'isar': image,
-            'density': debug_ret.get('density'),
-            'density_min': density_min,
-            'density_max': density_max,
-            'intensity': debug_ret.get('intensity'),
-            'points': debug_ret.get('points'),
-            'point_weight': debug_ret.get('point_weight'),
-            'range_bin': debug_ret.get('range_bin'),
-            'azimuth_bin': debug_ret.get('azimuth_bin'),
-            'range_coord': debug_ret.get('range_coord'),
-            'azimuth_coord': debug_ret.get('azimuth_coord'),
-            'alpha': debug_ret.get('alpha'),
-            'weights': debug_ret.get('weights'),
-            'gradient_error': torch.zeros([], dtype=torch.float32, device=device),
-        }
-
-    def render_ray_chunk_nerf(self, ray_bases, ray_dir, range_vals, ray_area, frame_meta,
-                               nerf_network, image_shape):
-        height, width = image_shape
-        n_rays = ray_bases.shape[0]
-        n_samples = range_vals.shape[0]
-        points = ray_bases[:, None, :] + range_vals[None, :, None] * ray_dir[None, None, :]
-        points_flat = points.reshape(-1, 3)
-        density, intensity = nerf_network.density_intensity(points_flat)
-        density = density.reshape(n_rays, n_samples, 1)
-        intensity = intensity.reshape(n_rays, n_samples, 1)
-        dists = self.compute_range_dists(range_vals[None, :].expand(n_rays, -1))
-        alpha, weights = self.compute_nerf_weights(density, dists)
-        point_weight = weights * intensity * ray_area
-
-        range_bin, azimuth_bin, range_coord, azimuth_coord = self.project_points(points_flat, frame_meta)
-        point_weight_flat = point_weight.reshape(-1)
-        if self.splat_mode == 1:
-            image = self._nearest_splat(range_bin, azimuth_bin, point_weight_flat, height, width)
-        elif self.splat_mode in (2, 3):
-            image = self._bilinear_splat(range_bin, azimuth_bin, point_weight_flat, height, width)
-        else:
-            raise ValueError('Unsupported splat_mode: {}'.format(self.splat_mode))
-
-        return {
-            'image': image,
-            'density': density.reshape(-1, 1),
-            'intensity': intensity.reshape(-1, 1),
-            'points': points_flat,
-            'point_weight': point_weight.reshape(-1, 1),
-            'range_bin': range_bin,
-            'azimuth_bin': azimuth_bin,
-            'range_coord': range_coord,
-            'azimuth_coord': azimuth_coord,
-            'alpha': alpha,
-            'weights': weights,
-        }
-
     def render_ray_chunk(self, ray_bases, ray_dir, coarse_range_vals, ray_area, frame_meta,
                          sdf_network, variance_network, image_shape, cos_anneal_ratio=1.0):
         height, width = image_shape
@@ -622,20 +531,6 @@ class ISARRenderer:
 
         return alpha, weights, 1.0 / inv_s
 
-    def compute_nerf_weights(self, density, dists):
-        n_rays, n_samples, _ = density.shape
-        dists = dists.reshape(n_rays, n_samples, 1)
-        alpha = 1.0 - torch.exp(-density.clamp_min(0.0) * dists)
-        alpha_flat = alpha.reshape(n_rays, n_samples)
-        trans = torch.cumprod(
-            torch.cat([
-                torch.ones([n_rays, 1], dtype=density.dtype, device=density.device),
-                1.0 - alpha_flat + 1e-7
-            ], dim=-1),
-            dim=-1
-        )[:, :-1]
-        return alpha, (alpha_flat * trans).reshape(n_rays, n_samples, 1)
-
     def render_bins(self, frame_meta, bins, sdf_network, variance_network,
                     image_shape=None, n_samples=None, cos_anneal_ratio=1.0):
         """
@@ -735,15 +630,6 @@ class ISARRenderer:
         image_4d = image[None, None, :, :]
         kernel_4d = kernel[None, None, :, :]
         return F.conv2d(image_4d, kernel_4d, padding=(radius_r, radius_a))[0, 0]
-
-    def extract_density_geometry(self, nerf_network, bound_min, bound_max, resolution, threshold):
-        from models.renderer import extract_geometry
-        device = next(nerf_network.parameters()).device
-        return extract_geometry(
-            bound_min, bound_max,
-            resolution=resolution, threshold=threshold,
-            query_func=lambda pts: nerf_network.density(pts.to(device))
-        )
 
     def extract_geometry(self, sdf_network, bound_min, bound_max, resolution, threshold=0.0):
         """
