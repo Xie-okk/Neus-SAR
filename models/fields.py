@@ -327,6 +327,47 @@ class NeRF(nn.Module):
             assert False
             
 
+class ISARNeRFNetwork(nn.Module):
+    """Position-encoded NeRF field with density and one ISAR intensity channel."""
+    def __init__(self,
+                 D=8,
+                 W=256,
+                 d_in=3,
+                 multires=0,
+                 skips=(4,)):
+        super().__init__()
+        self.embed_fn = None
+        input_ch = d_in
+        if multires > 0:
+            self.embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
+
+        self.skips = set(skips)
+        self.pts_linears = nn.ModuleList(
+            [nn.Linear(input_ch, W)] + [
+                nn.Linear(W + input_ch, W) if layer in self.skips else nn.Linear(W, W)
+                for layer in range(1, D)
+            ]
+        )
+        self.density_linear = nn.Linear(W, 1)
+        self.intensity_linear = nn.Linear(W, 1)
+
+    def forward(self, points):
+        embedded_points = self.embed_fn(points) if self.embed_fn is not None else points
+        hidden = embedded_points
+        for layer, linear in enumerate(self.pts_linears):
+            if layer in self.skips:
+                hidden = torch.cat([embedded_points, hidden], dim=-1)
+            hidden = F.relu(linear(hidden))
+        return self.density_linear(hidden), self.intensity_linear(hidden)
+
+    def density_intensity(self, points):
+        raw_density, raw_intensity = self(points)
+        return F.relu(raw_density), torch.sigmoid(raw_intensity)
+
+    def density(self, points):
+        return self.density_intensity(points)[0]
+
+
 class SingleVarianceNetwork(nn.Module):
     """
     NeuS Variance Network 
