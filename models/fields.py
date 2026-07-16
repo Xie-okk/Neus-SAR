@@ -20,7 +20,6 @@ class SDFNetwork(nn.Module):
                  geometric_init=True,
                  weight_norm=True,
                  init_ellipsoid_scale=(1.0, 1.0, 1.0),
-                 sdf_mode='mlp',
                  ellipsoid_radius=None,
                  ellipsoid_center=(0.0, 0.0, 0.0),
                  learn_ellipsoid=False,
@@ -36,34 +35,29 @@ class SDFNetwork(nn.Module):
         if torch.any(init_ellipsoid_scale <= 0):
             raise ValueError('init_ellipsoid_scale values must be positive')
 
-        self.sdf_mode = str(sdf_mode)
-        if self.sdf_mode not in ('mlp', 'ellipsoid_residual'):
-            raise ValueError("sdf_mode must be 'mlp' or 'ellipsoid_residual'")
-        self.use_ellipsoid_residual = self.sdf_mode == 'ellipsoid_residual'
         self.residual_scale = float(residual_scale)
         self.learn_ellipsoid = bool(learn_ellipsoid)
 
-        if self.use_ellipsoid_residual:
-            if d_in != 3:
-                raise ValueError('ellipsoid_residual mode requires d_in == 3')
-            if ellipsoid_radius is None:
-                ellipsoid_radius = init_ellipsoid_scale
-            ellipsoid_radius = torch.tensor(ellipsoid_radius, dtype=torch.float32)
-            ellipsoid_center = torch.tensor(ellipsoid_center, dtype=torch.float32)
-            if ellipsoid_radius.numel() != 3:
-                raise ValueError('ellipsoid_radius must contain exactly 3 values')
-            if ellipsoid_center.numel() != 3:
-                raise ValueError('ellipsoid_center must contain exactly 3 values')
-            if torch.any(ellipsoid_radius <= 0):
-                raise ValueError('ellipsoid_radius values must be positive')
+        if d_in != 3:
+            raise ValueError('SDFNetwork requires d_in == 3 for ellipsoid residual SDF')
+        if ellipsoid_radius is None:
+            ellipsoid_radius = init_ellipsoid_scale
+        ellipsoid_radius = torch.tensor(ellipsoid_radius, dtype=torch.float32)
+        ellipsoid_center = torch.tensor(ellipsoid_center, dtype=torch.float32)
+        if ellipsoid_radius.numel() != 3:
+            raise ValueError('ellipsoid_radius must contain exactly 3 values')
+        if ellipsoid_center.numel() != 3:
+            raise ValueError('ellipsoid_center must contain exactly 3 values')
+        if torch.any(ellipsoid_radius <= 0):
+            raise ValueError('ellipsoid_radius values must be positive')
 
-            if self.learn_ellipsoid:
-                self.ellipsoid_log_radius = nn.Parameter(torch.log(ellipsoid_radius))
-                self.ellipsoid_center = nn.Parameter(ellipsoid_center)
-            else:
-                self.register_buffer('ellipsoid_radius', ellipsoid_radius)
-                self.register_buffer('ellipsoid_center', ellipsoid_center)
-            self.residual_weight = nn.Parameter(torch.tensor(float(residual_init_weight), dtype=torch.float32))
+        if self.learn_ellipsoid:
+            self.ellipsoid_log_radius = nn.Parameter(torch.log(ellipsoid_radius))
+            self.ellipsoid_center = nn.Parameter(ellipsoid_center)
+        else:
+            self.register_buffer('ellipsoid_radius', ellipsoid_radius)
+            self.register_buffer('ellipsoid_center', ellipsoid_center)
+        self.residual_weight = nn.Parameter(torch.tensor(float(residual_init_weight), dtype=torch.float32))
 
         self.embed_fn_fine = None
 
@@ -153,9 +147,6 @@ class SDFNetwork(nn.Module):
                 x = self.activation(x)
 
         mlp_output = torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
-        if not self.use_ellipsoid_residual:
-            return mlp_output
-
         residual = self.residual_scale * self.residual_weight * mlp_output[:, :1]
         sdf = self.ellipsoid_sdf(raw_inputs) + residual
         return torch.cat([sdf, mlp_output[:, 1:]], dim=-1)

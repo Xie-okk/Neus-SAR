@@ -121,9 +121,6 @@ class ISARRunner:
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.image_weight = self.conf.get_float('train.image_weight', default=1.0)
-        self.image_loss_type = self.conf.get_string('train.image_loss_type', default='l1').lower()
-        self.huber_beta = self.conf.get_float('train.huber_beta', default=0.1)
-        self.charbonnier_eps = self.conf.get_float('train.charbonnier_eps', default=1e-3)
         self.igr_weight = self.conf.get_float('train.igr_weight', default=0.1)
         self.export_init_mesh = self.conf.get_bool('validate.export_init_mesh', default=True)
         self.export_init_image = self.conf.get_bool('validate.export_init_image', default=False)
@@ -371,20 +368,7 @@ class ISARRunner:
     def get_image_perm(self):
         return torch.randperm(self.dataset.n_images)
     def compute_image_loss(self, pred_image_norm, target_image_norm):
-        if self.image_loss_type == 'l1':
-            return F.l1_loss(pred_image_norm, target_image_norm)
-        if self.image_loss_type in ('huber', 'smooth_l1'):
-            return F.smooth_l1_loss(
-                pred_image_norm,
-                target_image_norm,
-                beta=self.huber_beta
-            )
-        if self.image_loss_type == 'charbonnier':
-            diff = pred_image_norm - target_image_norm
-            return torch.sqrt(diff * diff + self.charbonnier_eps * self.charbonnier_eps).mean()
-        raise ValueError(
-            "train.image_loss_type must be one of: l1, huber, smooth_l1, charbonnier"
-        )
+        return F.l1_loss(pred_image_norm, target_image_norm)
 
     def update_learning_rate(self):
         if self.iter_step < self.warm_up_end and self.warm_up_end > 0:
