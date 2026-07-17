@@ -642,10 +642,21 @@ class ISARRunner:
         img = np.asarray(img, dtype=np.float32)
         img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
         img = np.clip(img, 0.0, None)
-        vmax = np.max(img)
-        if vmax <= 1e-8:
+        scale = np.percentile(img, 99.9)
+        if (not np.isfinite(scale)) or scale <= 1e-8:
+            scale = np.max(img)
+        if scale <= 1e-8:
             return np.zeros_like(img, dtype=np.uint8)
-        return (np.clip(img / vmax, 0.0, 1.0) * 255).astype(np.uint8)
+        return (np.clip(img / scale, 0.0, 1.0) * 255).astype(np.uint8)
+
+    def _mean_normalize_validation_image(self, img):
+        img = np.asarray(img, dtype=np.float32)
+        img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+        img = np.clip(img, 0.0, None)
+        mean = np.mean(img)
+        if (not np.isfinite(mean)) or mean <= 1e-8:
+            return np.zeros_like(img, dtype=np.float32)
+        return img / mean
 
     def _render_validation_pair(self, idx):
         target_image, frame_meta = self.dataset.get_frame(idx)
@@ -658,10 +669,11 @@ class ISARRunner:
 
         pred = render_out['isar'].detach().cpu().numpy()
         target = target_image.detach().cpu().numpy()
-        return np.concatenate([
-            self._normalize_validation_image(target),
-            self._normalize_validation_image(pred)
-        ], axis=1)
+        target_norm = self._mean_normalize_validation_image(target)
+        pred_norm = self._mean_normalize_validation_image(pred)
+        return self._normalize_validation_image(
+            np.concatenate([target_norm, pred_norm], axis=1)
+        )
 
     def validate_image(self, idx=None):
         if idx is None:
