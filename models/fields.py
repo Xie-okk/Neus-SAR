@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,45 +18,10 @@ class SDFNetwork(nn.Module):
                  scale=1,
                  geometric_init=True,
                  weight_norm=True,
-                 init_ellipsoid_scale=(1.0, 1.0, 1.0),
-                 ellipsoid_radius=None,
-                 ellipsoid_center=(0.0, 0.0, 0.0),
-                 learn_ellipsoid=False,
-                 residual_scale=1.0,
-                 residual_init_weight=0.0,
                  inside_outside=False):
         super(SDFNetwork, self).__init__()
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
-        init_ellipsoid_scale = torch.tensor(init_ellipsoid_scale, dtype=torch.float32)
-        if init_ellipsoid_scale.numel() != 3:
-            raise ValueError('init_ellipsoid_scale must contain exactly 3 values')
-        if torch.any(init_ellipsoid_scale <= 0):
-            raise ValueError('init_ellipsoid_scale values must be positive')
-
-        self.residual_scale = float(residual_scale)
-        self.learn_ellipsoid = bool(learn_ellipsoid)
-
-        if d_in != 3:
-            raise ValueError('SDFNetwork requires d_in == 3 for ellipsoid residual SDF')
-        if ellipsoid_radius is None:
-            ellipsoid_radius = init_ellipsoid_scale
-        ellipsoid_radius = torch.tensor(ellipsoid_radius, dtype=torch.float32)
-        ellipsoid_center = torch.tensor(ellipsoid_center, dtype=torch.float32)
-        if ellipsoid_radius.numel() != 3:
-            raise ValueError('ellipsoid_radius must contain exactly 3 values')
-        if ellipsoid_center.numel() != 3:
-            raise ValueError('ellipsoid_center must contain exactly 3 values')
-        if torch.any(ellipsoid_radius <= 0):
-            raise ValueError('ellipsoid_radius values must be positive')
-
-        if self.learn_ellipsoid:
-            self.ellipsoid_log_radius = nn.Parameter(torch.log(ellipsoid_radius))
-            self.ellipsoid_center = nn.Parameter(ellipsoid_center)
-        else:
-            self.register_buffer('ellipsoid_radius', ellipsoid_radius)
-            self.register_buffer('ellipsoid_center', ellipsoid_center)
-        self.residual_weight = nn.Parameter(torch.tensor(float(residual_init_weight), dtype=torch.float32))
 
         self.embed_fn_fine = None
 
@@ -90,18 +54,13 @@ class SDFNetwork(nn.Module):
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
                     torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                    lin.weight.data[:, :3] /= init_ellipsoid_scale.to(lin.weight.device)
                 elif multires > 0 and l in self.skip_in:
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
                     torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3):], 0.0)
-                    skip_input_start = lin.weight.shape[1] - dims[0]
-                    lin.weight.data[:, skip_input_start:skip_input_start + 3] /= init_ellipsoid_scale.to(lin.weight.device)
                 else:
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                    if l == 0:
-                        lin.weight.data[:, :3] /= init_ellipsoid_scale.to(lin.weight.device)
 
             if weight_norm:
                 lin = nn.utils.weight_norm(lin)
@@ -110,26 +69,8 @@ class SDFNetwork(nn.Module):
 
         self.activation = nn.Softplus(beta=100)
 
-    def get_ellipsoid_radius(self):
-        if self.learn_ellipsoid:
-            return torch.exp(self.ellipsoid_log_radius).clamp_min(1e-4)
-        return self.ellipsoid_radius
-
-    def ellipsoid_sdf(self, inputs):
-        radius = self.get_ellipsoid_radius().to(device=inputs.device, dtype=inputs.dtype)
-        center = self.ellipsoid_center.to(device=inputs.device, dtype=inputs.dtype)
-        points = inputs[:, :3] - center[None, :]
-
-        # Analytic ellipsoid SDF approximation. It is exact for a sphere and has
-        # the correct signed zero level set for arbitrary positive semi-axes.
-        k0 = torch.linalg.norm(points / radius[None, :], ord=2, dim=-1, keepdim=True)
-        k1 = torch.linalg.norm(points / (radius[None, :] ** 2), ord=2, dim=-1, keepdim=True)
-        sdf = k0 * (k0 - 1.0) / k1.clamp_min(1e-6)
-        center_sdf = -torch.min(radius).expand_as(sdf)
-        return torch.where(k1 > 1e-6, sdf, center_sdf)
 
     def forward(self, inputs):
-        raw_inputs = inputs
         inputs = inputs * self.scale
         if self.embed_fn_fine is not None:
             inputs = self.embed_fn_fine(inputs)
@@ -146,10 +87,7 @@ class SDFNetwork(nn.Module):
             if l < self.num_layers - 2:
                 x = self.activation(x)
 
-        mlp_output = torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
-        residual = self.residual_scale * self.residual_weight * mlp_output[:, :1]
-        sdf = self.ellipsoid_sdf(raw_inputs) + residual
-        return torch.cat([sdf, mlp_output[:, 1:]], dim=-1)
+        return torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
 
     def sdf(self, x):
         return self.forward(x)[:, :1]

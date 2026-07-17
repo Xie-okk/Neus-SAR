@@ -217,8 +217,9 @@ class ISARRenderer:
             image = self._apply_sinc_psf(image, frame_meta)
 
         
-        eps = 1e-6
-        image = torch.sqrt(torch.clamp(image, min=0.0) + eps) - np.sqrt(eps)
+        # eps = 1e-6
+        # image = torch.sqrt(torch.clamp(image, min=0.0) + eps) - np.sqrt(eps)
+        image = torch.clamp(image, min=0.0)
 
         # image = image / (image.max().detach() + 1e-8)   # normalize to [0, 1] for visualization/output
 

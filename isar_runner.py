@@ -230,8 +230,10 @@ class ISARRunner:
             )
 
             pred_image = render_out['isar']
-            pred_image_norm = pred_image / (pred_image.mean().detach() + 1e-6)
-            target_image_norm = target_image / (target_image.mean().detach() + 1e-6)
+            pred_mean = pred_image.mean().detach().clamp_min(1e-8)
+            target_mean = target_image.mean().detach().clamp_min(1e-8)
+            pred_image_norm = pred_image / pred_mean
+            target_image_norm = target_image / target_mean
             image_loss_raw = self.compute_image_loss(pred_image_norm, target_image_norm)
             
             eikonal_loss_raw = render_out['gradient_error']
@@ -476,19 +478,53 @@ class ISARRunner:
     def init_metrics_log(self):
         os.makedirs(os.path.dirname(self.metrics_path), exist_ok=True)
         if (not self.is_continue) and self.iter_step == 0:
-            mode = 'w'
-        else:
-            mode = 'a' if os.path.exists(self.metrics_path) else 'w'
+            self.write_metrics_header(self.metrics_path)
+            return
 
-        if mode == 'a' and not self.metrics_header_matches(self.metrics_path):
+        if os.path.exists(self.metrics_path) and not self.metrics_header_matches(self.metrics_path):
             root, ext = os.path.splitext(self.metrics_path)
             self.metrics_path = root + '_weighted' + ext
-            mode = 'a' if os.path.exists(self.metrics_path) else 'w'
 
-        if mode == 'w':
-            with open(self.metrics_path, mode, newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=self.metric_fieldnames())
-                writer.writeheader()
+        if os.path.exists(self.metrics_path):
+            self.truncate_metrics_log_for_resume()
+        else:
+            self.write_metrics_header(self.metrics_path)
+
+    def write_metrics_header(self, path):
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=self.metric_fieldnames())
+            writer.writeheader()
+
+    def truncate_metrics_log_for_resume(self):
+        fieldnames = self.metric_fieldnames()
+        latest_rows = {}
+        original_count = 0
+        try:
+            with open(self.metrics_path, 'r', newline='', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    original_count += 1
+                    try:
+                        iter_num = int(row.get('iter', ''))
+                    except (TypeError, ValueError):
+                        continue
+                    if iter_num <= self.iter_step:
+                        latest_rows[iter_num] = {name: row.get(name, '') for name in fieldnames}
+        except OSError:
+            self.write_metrics_header(self.metrics_path)
+            return
+
+        kept_iters = sorted(latest_rows)
+        with open(self.metrics_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for iter_num in kept_iters:
+                writer.writerow(latest_rows[iter_num])
+
+        kept_count = len(kept_iters)
+        if original_count != kept_count:
+            print(f'train_metrics.csv trimmed for resume: kept {kept_count}/{original_count} rows '
+                  f'(iter <= {self.iter_step})')
 
     def metrics_header_matches(self, path):
         try:
