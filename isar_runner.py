@@ -230,8 +230,10 @@ class ISARRunner:
             )
 
             pred_image = render_out['isar']
+            noise_floor = self.estimate_abs_noise_floor(target_image)
+            target_signal = (target_image - noise_floor).clamp_min(0.0)
             pred_image_norm = pred_image / (pred_image.mean().detach() + 1e-6)
-            target_image_norm = target_image / (target_image.mean().detach() + 1e-6)
+            target_image_norm = target_signal / (target_signal.mean().detach() + 1e-6)
             image_loss_raw = self.compute_image_loss(pred_image_norm, target_image_norm)
             
             eikonal_loss_raw = render_out['gradient_error']
@@ -259,6 +261,8 @@ class ISARRunner:
             self.writer.add_scalar('Statistics/cos_anneal_ratio', cos_anneal_ratio, self.iter_step)
             self.writer.add_scalar('Statistics/inv_s', current_inv_s, self.iter_step)
             self.writer.add_scalar('Statistics/n_height', self.renderer.n_height, self.iter_step)
+            self.writer.add_scalar('Statistics/noise_floor', noise_floor.item(), self.iter_step)
+            self.writer.add_scalar('Statistics/target_signal_mean', target_signal.mean().item(), self.iter_step)
 
             train_metrics = self.collect_train_metrics(
                 frame_idx,
@@ -367,6 +371,17 @@ class ISARRunner:
 
     def get_image_perm(self):
         return torch.randperm(self.dataset.n_images)
+
+    def estimate_abs_noise_floor(self, target_image):
+        height, width = target_image.shape
+        border = max(1, min(height, width) // 10)
+        border_mask = torch.zeros_like(target_image, dtype=torch.bool)
+        border_mask[:border, :] = True
+        border_mask[-border:, :] = True
+        border_mask[:, :border] = True
+        border_mask[:, -border:] = True
+        return target_image[border_mask].mean().detach()
+
     def compute_image_loss(self, pred_image_norm, target_image_norm):
         return F.l1_loss(pred_image_norm, target_image_norm)
 
@@ -746,4 +761,3 @@ if __name__ == '__main__':
     elif args.mode == 'validate_mesh':
         mesh_resolution = args.mesh_resolution if args.mesh_resolution is not None else runner.get_mesh_resolution()
         runner.validate_mesh(resolution=mesh_resolution, threshold=args.mcube_threshold)
-

@@ -1,0 +1,43 @@
+Host:127.0.0.1
+    Hostname:127.0.0.1
+    Prot:18022
+    User:lpy
+    passport:liupeiyao
+
+请通过 SSH 连接我的远程服务器，并在已有的 NeuS 项目中工作。
+
+SSH 信息已在本地 ssh.txt 中提供。使用其中的密码认证，但不要在对话中回显密码或其他敏感信息。
+
+远程项目目录：
+~/AICode/XZC/NeuS-main
+
+
+Python 环境：
+/home/lpy/.conda/envs/neus_py38/bin/python
+
+已知 GPU 情况：
+GPU 0 存在 NVIDIA device-handle 错误；训练优先使用 --gpu 1、--gpu 2 或 --gpu 3。执行训练前先检查指定 GPU 是否可用。
+
+连接后先只读确认：
+1. 项目目录存在；
+2. Python 环境可运行；
+3. 指定 GPU 可用；
+4. 当前 Git 状态和已有训练进程。
+
+未经我明确要求，不要启动或停止训练，不要覆盖 checkpoint、日志或远程代码。执行会修改服务器状态的命令前，先说明具体命令及影响范围。
+远程操作边界：
+
+只允许访问、读取、修改和执行以下项目目录及其子目录：
+~/AICode/XZC/NeuS-main
+
+不得进入、列出、读取、写入、复制、移动、删除或修改任何其他用户目录、项目目录、数据目录、系统目录或 SSH 配置目录。
+
+允许仅用于执行本项目的 Python 解释器：
+/home/lpy/.conda/envs/neus_py38/bin/python
+
+但不得读取、修改、安装、卸载该环境中的任何文件或包。
+
+所有训练输出、日志、checkpoint 和临时文件必须位于：
+~/AICode/XZC/NeuS-main
+
+如果完成任务必须访问项目目录以外的文件，必须先说明具体路径、用途和是否会修改，再等待我的明确授权。

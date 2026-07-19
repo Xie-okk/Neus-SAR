@@ -249,14 +249,30 @@ def generate_isar_dataset(
     clean_stack = np.stack(generated_images, axis=0).astype(np.float32)
     if noise_snr_db is not None:
         snr = 10 ** (noise_snr_db / 10.0)
-        clean_max = float(np.max(clean_stack))
+        # clean_stack is the noise-free power image after PSF filtering.
+        # Model pre-detection receiver noise with two orthogonal real Gaussian
+        # components: P_noisy = (sqrt(P) + n_i)^2 + n_q^2.
+        clean_power = np.maximum(clean_stack, 0.0)
+        clean_max = float(np.max(clean_power))
         if clean_max > 0.0:
-            signal_mask = clean_stack > clean_max * 1e-2
-            signal_ref = float(np.mean(np.abs(clean_stack[signal_mask]))) if np.any(signal_mask) else clean_max
-            noise_std = signal_ref / np.sqrt(snr)
-            noise = noise_std * rng.standard_normal(clean_stack.shape).astype(np.float32)
-            final_stack = np.clip(clean_stack + noise, 0.0, None)
-            print(f"Added uniform thermal noise: snr_db={noise_snr_db}, noise_std={noise_std:.6g}")
+            signal_mask = clean_power > clean_max * 1e-2
+            signal_power_ref = (
+                float(np.mean(clean_power[signal_mask]))
+                if np.any(signal_mask)
+                else clean_max
+            )
+            noise_power = signal_power_ref / snr
+            noise_sigma = np.sqrt(noise_power / 2.0)
+            noise_i = noise_sigma * rng.standard_normal(clean_power.shape).astype(np.float32)
+            noise_q = noise_sigma * rng.standard_normal(clean_power.shape).astype(np.float32)
+            final_stack = (
+                (np.sqrt(clean_power) + noise_i) ** 2
+                + noise_q ** 2
+            ).astype(np.float32)
+            print(
+                f"Added detected-power thermal noise: snr_db={noise_snr_db}, "
+                f"noise_power={noise_power:.6g}, component_sigma={noise_sigma:.6g}"
+            )
         else:
             final_stack = clean_stack
             print('Skip thermal noise: clean image stack has non-positive maximum')
@@ -348,7 +364,7 @@ if __name__ == "__main__":
             range_grid_spacing=1,         
             doppler_grid_spacing=calc_doppler_spacing,   # <--- 直接传入计算好的公式变量
             image_size=(64, 64),
-            noise_snr_db=None,                           # None代表不加噪声；数值表示统一热噪声目标 SNR(dB)
+            noise_snr_db=0,                           # None代表不加噪声；数值表示统一热噪声目标 SNR(dB)
             noise_seed=20260708
         )
     else:
