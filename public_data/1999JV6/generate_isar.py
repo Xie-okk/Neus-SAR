@@ -279,10 +279,10 @@ def generate_isar_dataset(
     else:
         final_stack = clean_stack
 
-    global_scale = float(np.percentile(final_stack, 99.9))
+    global_scale = float(np.percentile(clean_stack, 100))
     if not np.isfinite(global_scale) or global_scale <= 0.0:
         global_scale = float(np.max(final_stack))
-    print(f"Normalize saved images by global 99.9 percentile: {global_scale:.6g}")
+    print(f"Normalize saved images by global 100 percentile: {global_scale:.6g}")
 
     overview_tiles = []
     for file_name, isar_image in zip(image_file_names, final_stack):
@@ -364,7 +364,7 @@ if __name__ == "__main__":
             range_grid_spacing=1,         
             doppler_grid_spacing=calc_doppler_spacing,   # <--- 直接传入计算好的公式变量
             image_size=(64, 64),
-            noise_snr_db=0,                           # None代表不加噪声；数值表示统一热噪声目标 SNR(dB)
+            noise_snr_db=None,                           # None代表不加噪声；数值表示统一热噪声目标 SNR(dB)
             noise_seed=20260708
         )
     else:

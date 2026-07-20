@@ -47,7 +47,7 @@ class ISARRenderer:
                  n_importance=0,            # NeuS up-sampling 追加的 fine 距离向采样数
                  up_sample_steps=1,         # fine 采样分几轮加入
                  n_height=None,            # None 时取 W，表示 ISAR 投影丢掉的第三维采样数
-                 ray_chunk=1024):          # 按 ray 分块，降低一次性 SDF/梯度显存峰值
+                 ray_chunk=4096):          # 按 ray 分块，降低一次性 SDF/梯度显存峰值 1024
         self.bound = float(bound)
         self.splat_mode = int(splat_mode)
         self.psf_lobes = int(psf_lobes)

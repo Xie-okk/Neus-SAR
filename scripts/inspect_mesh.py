@@ -1,7 +1,7 @@
 import trimesh
 import numpy as np
 import os
-p = os.path.join('exp','1999JV6','meshes','mesh_000000.ply')
+p = os.path.join('exp','1999JV6','meshes','mesh_001000.ply')
 mesh = trimesh.load(p)
 verts = np.asarray(mesh.vertices)
 print('path:', p)

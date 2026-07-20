@@ -300,6 +300,9 @@ class ISARRunner:
                 eikonal_loss_raw,
                 cos_anneal_ratio,
                 current_inv_s,
+                noise_power,
+                image_gain,
+                pred_power,
                 target_image,
                 render_out
             )
@@ -590,6 +593,9 @@ class ISARRunner:
             'image_loss_raw', 'eikonal_loss_raw', 'image_weight', 'igr_weight',
             'lr', 'inv_s', 'cos_anneal_ratio', 'n_height',
             'target_mean', 'target_max', 'pred_mean', 'pred_max',
+            'noise_power', 'image_gain', 'pred_power_mean', 'pred_power_max',
+            'mean_power_mean', 'mean_power_max',
+            'residual_mean', 'residual_abs_mean', 'residual_max',
             'alpha_mean', 'alpha_max', 'weight_mean', 'weight_max',
             'point_weight_mean', 'point_weight_max', 'sdf_min', 'sdf_max'
         ]
@@ -626,8 +632,12 @@ class ISARRunner:
 
     def collect_train_metrics(self, frame_idx, loss, image_loss, eikonal_loss,
                               image_loss_raw, eikonal_loss_raw,
-                              cos_anneal_ratio, current_inv_s, target_image, render_out):
+                              cos_anneal_ratio, current_inv_s,
+                              noise_power, image_gain, pred_power,
+                              target_image, render_out):
         pred_image = render_out.get('isar')
+        mean_power = pred_power.clamp_min(0.0) + noise_power.clamp_min(self.noise_likelihood_min)
+        residual = target_image.clamp_min(0.0) - mean_power
         alpha = render_out.get('alpha')
         weights = render_out.get('weights')
         point_weight = render_out.get('point_weight')
@@ -652,6 +662,15 @@ class ISARRunner:
             'target_max': self.tensor_stat(target_image, torch.max),
             'pred_mean': self.tensor_stat(pred_image, torch.mean),
             'pred_max': self.tensor_stat(pred_image, torch.max),
+            'noise_power': float(noise_power.detach().item()),
+            'image_gain': float(image_gain.detach().item()),
+            'pred_power_mean': self.tensor_stat(pred_power, torch.mean),
+            'pred_power_max': self.tensor_stat(pred_power, torch.max),
+            'mean_power_mean': self.tensor_stat(mean_power, torch.mean),
+            'mean_power_max': self.tensor_stat(mean_power, torch.max),
+            'residual_mean': self.tensor_stat(residual, torch.mean),
+            'residual_abs_mean': self.tensor_stat(torch.abs(residual), torch.mean),
+            'residual_max': self.tensor_stat(torch.abs(residual), torch.max),
             'alpha_mean': self.tensor_stat(alpha, torch.mean),
             'alpha_max': self.tensor_stat(alpha, torch.max),
             'weight_mean': self.tensor_stat(weights, torch.mean),

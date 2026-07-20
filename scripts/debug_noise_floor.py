@@ -237,12 +237,24 @@ def analyze_values(file_name, values, border_width):
 def main():
     parser = argparse.ArgumentParser(description='Fit noise distributions to the outer border of radar power images.')
     parser.add_argument('--image_dir', type=str, default=os.path.join('public_data', '1999JV6', 'image'))
-    parser.add_argument('--out_dir', type=str, default=os.path.join('exp', '1999JV6', 'logs', 'noise_distribution'))
+    parser.add_argument(
+        '--out_dir',
+        type=str,
+        default=None,
+        help=(
+            'Output directory. By default, write next to the input image '
+            'directory as public_data/<case>/noise_distribution.'
+        ),
+    )
     parser.add_argument('--border_frac', type=float, default=0.10)
     parser.add_argument('--bins', type=int, default=80)
     parser.add_argument('--hist_quantile', type=float, default=0.999)
     parser.add_argument('--max_images', type=int, default=None)
     args = parser.parse_args()
+
+    if args.out_dir is None:
+        case_dir = os.path.dirname(os.path.normpath(args.image_dir))
+        args.out_dir = os.path.join(case_dir, 'noise_distribution')
 
     paths = find_images(args.image_dir)
     if args.max_images is not None:
