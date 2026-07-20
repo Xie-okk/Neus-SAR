@@ -122,6 +122,9 @@ class ISARRunner:
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.image_weight = self.conf.get_float('train.image_weight', default=1.0)
         self.igr_weight = self.conf.get_float('train.igr_weight', default=0.1)
+        self.gain_learning_rate = self.conf.get_float('train.gain_learning_rate', default=1e-2)
+        self.noise_border_fraction = self.conf.get_float('train.noise_border_fraction', default=0.10)
+        self.noise_likelihood_min = self.conf.get_float('train.noise_likelihood_min', default=1e-6)
         self.export_init_mesh = self.conf.get_bool('validate.export_init_mesh', default=True)
         self.export_init_image = self.conf.get_bool('validate.export_init_image', default=False)
         self.export_init_sdf = self.conf.get_bool('validate.export_init_sdf', default=True)
@@ -146,10 +149,17 @@ class ISARRunner:
             init_val=self.conf.get_float('model.variance_network.init_val', 50.0)
         ).to(self.device)
 
+        self.log_image_gain = torch.nn.Parameter(torch.zeros([], device=self.device))
+        self.frame_noise_power = self.estimate_dataset_noise_power()
+
         # 优化器
         params_to_train = list(self.sdf_network.parameters()) + \
                           list(self.variance_network.parameters())
-        self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
+        gain_lr_scale = self.gain_learning_rate / max(self.learning_rate, 1e-12)
+        self.optimizer = torch.optim.Adam([
+            {'params': params_to_train, 'lr_scale': 1.0},
+            {'params': [self.log_image_gain], 'lr_scale': gain_lr_scale},
+        ], lr=self.learning_rate)
 
         # 渲染器（使用我们最终极简版本）
         self.renderer = ISARRenderer(**self.conf['model.isar_renderer'])
@@ -230,11 +240,14 @@ class ISARRunner:
             )
 
             pred_image = render_out['isar']
-            noise_floor = self.estimate_abs_noise_floor(target_image)
-            target_signal = (target_image - noise_floor).clamp_min(0.0)
-            pred_image_norm = pred_image / (pred_image.mean().detach() + 1e-6)
-            target_image_norm = target_signal / (target_signal.mean().detach() + 1e-6)
-            image_loss_raw = self.compute_image_loss(pred_image_norm, target_image_norm)
+            noise_power = self.frame_noise_power[frame_idx]
+            image_gain = self.get_image_gain()
+            pred_power = image_gain * pred_image
+            image_loss_raw = self.compute_power_noise_loss(
+                pred_power,
+                target_image,
+                noise_power
+            )
             
             eikonal_loss_raw = render_out['gradient_error']
             image_loss = self.image_weight * image_loss_raw
@@ -261,8 +274,9 @@ class ISARRunner:
             self.writer.add_scalar('Statistics/cos_anneal_ratio', cos_anneal_ratio, self.iter_step)
             self.writer.add_scalar('Statistics/inv_s', current_inv_s, self.iter_step)
             self.writer.add_scalar('Statistics/n_height', self.renderer.n_height, self.iter_step)
-            self.writer.add_scalar('Statistics/noise_floor', noise_floor.item(), self.iter_step)
-            self.writer.add_scalar('Statistics/target_signal_mean', target_signal.mean().item(), self.iter_step)
+            self.writer.add_scalar('Statistics/noise_power', noise_power.item(), self.iter_step)
+            self.writer.add_scalar('Statistics/image_gain', image_gain.item(), self.iter_step)
+            self.writer.add_scalar('Statistics/pred_power_mean', pred_power.mean().item(), self.iter_step)
 
             train_metrics = self.collect_train_metrics(
                 frame_idx,
@@ -283,7 +297,8 @@ class ISARRunner:
                       f"img_w={image_loss.item():.6f} eik_w={eikonal_loss.item():.6f} "
                       f"img_raw={image_loss_raw.item():.6f} eik_raw={eikonal_loss_raw.item():.6f} "
                       f"cos={cos_anneal_ratio:.3f} lr={self.optimizer.param_groups[0]['lr']:.2e} "
-                      f"inv_s={current_inv_s:.2f}") 
+                      f"inv_s={current_inv_s:.2f} gain={image_gain.item():.4g} "
+                      f"noise={noise_power.item():.4g}")
 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
@@ -372,18 +387,31 @@ class ISARRunner:
     def get_image_perm(self):
         return torch.randperm(self.dataset.n_images)
 
-    def estimate_abs_noise_floor(self, target_image):
+    def estimate_power_noise(self, target_image):
         height, width = target_image.shape
-        border = max(1, min(height, width) // 10)
+        border = max(1, int(np.ceil(min(height, width) * self.noise_border_fraction)))
         border_mask = torch.zeros_like(target_image, dtype=torch.bool)
         border_mask[:border, :] = True
         border_mask[-border:, :] = True
         border_mask[:, :border] = True
         border_mask[:, -border:] = True
-        return target_image[border_mask].mean().detach()
+        return target_image[border_mask].mean().detach().clamp_min(self.noise_likelihood_min)
 
-    def compute_image_loss(self, pred_image_norm, target_image_norm):
-        return F.l1_loss(pred_image_norm, target_image_norm)
+    def estimate_dataset_noise_power(self):
+        return torch.stack([
+            self.estimate_power_noise(self.dataset.get_frame(idx)[0])
+            for idx in range(self.dataset.n_images)
+        ])
+
+    def get_image_gain(self):
+        return torch.exp(self.log_image_gain)
+
+    def compute_power_noise_loss(self, pred_power, target_power, noise_power):
+        observed = target_power.clamp_min(0.0) / noise_power
+        predicted = pred_power.clamp_min(0.0) / noise_power
+        bessel_arg = 2.0 * torch.sqrt((observed * predicted).clamp_min(0.0))
+        log_i0 = torch.log(torch.special.i0e(bessel_arg) + 1e-8) + bessel_arg
+        return (observed + predicted - log_i0).mean()
 
     def update_learning_rate(self):
         if self.iter_step < self.warm_up_end and self.warm_up_end > 0:
@@ -394,7 +422,7 @@ class ISARRunner:
                            max(1.0, self.end_iter - self.warm_up_end))
             factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
         for g in self.optimizer.param_groups:
-            g['lr'] = self.learning_rate * factor
+            g['lr'] = self.learning_rate * factor * g.get('lr_scale', 1.0)
 
     def get_cos_anneal_ratio(self):
         if self.anneal_end <= 0.0:
@@ -462,6 +490,7 @@ class ISARRunner:
         checkpoint = torch.load(path, map_location=self.device)
         self.sdf_network.load_state_dict(checkpoint['sdf_network'])
         self.variance_network.load_state_dict(checkpoint['variance_network'])
+        self.log_image_gain.data.copy_(checkpoint['log_image_gain'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.iter_step = checkpoint['iter_step']
         logging.info(f'Checkpoint loaded (iter {self.iter_step})')
@@ -470,6 +499,7 @@ class ISARRunner:
         checkpoint = {
             'sdf_network': self.sdf_network.state_dict(),
             'variance_network': self.variance_network.state_dict(),
+            'log_image_gain': self.log_image_gain.detach(),
             'optimizer': self.optimizer.state_dict(),
             'iter_step': self.iter_step,
         }
