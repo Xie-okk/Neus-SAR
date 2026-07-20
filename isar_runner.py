@@ -125,6 +125,12 @@ class ISARRunner:
         self.gain_learning_rate = self.conf.get_float('train.gain_learning_rate', default=1e-2)
         self.noise_border_fraction = self.conf.get_float('train.noise_border_fraction', default=0.10)
         self.noise_likelihood_min = self.conf.get_float('train.noise_likelihood_min', default=1e-6)
+        self.effective_looks = self.conf.get_float('train.effective_looks', default=1.0)
+        self.loss_epsilon = self.conf.get_float('train.loss_epsilon', default=1e-8)
+        if self.effective_looks <= 0.0:
+            raise ValueError('train.effective_looks must be positive')
+        if self.loss_epsilon <= 0.0:
+            raise ValueError('train.loss_epsilon must be positive')
         self.export_init_mesh = self.conf.get_bool('validate.export_init_mesh', default=True)
         self.export_init_image = self.conf.get_bool('validate.export_init_image', default=False)
         self.export_init_sdf = self.conf.get_bool('validate.export_init_sdf', default=True)
@@ -254,9 +260,15 @@ class ISARRunner:
             eikonal_loss = self.igr_weight * eikonal_loss_raw
             loss = image_loss + eikonal_loss
 
-            self.optimizer.zero_grad()
+            self.ensure_finite_tensor('total loss', loss, frame_idx)
+            self.ensure_finite_tensor('image loss', image_loss_raw, frame_idx)
+            self.ensure_finite_tensor('eikonal loss', eikonal_loss_raw, frame_idx)
+
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            self.ensure_finite_gradients(frame_idx)
             self.optimizer.step()
+            self.ensure_finite_parameters(frame_idx)
 
             self.iter_step += 1
             with torch.no_grad():
@@ -277,6 +289,7 @@ class ISARRunner:
             self.writer.add_scalar('Statistics/noise_power', noise_power.item(), self.iter_step)
             self.writer.add_scalar('Statistics/image_gain', image_gain.item(), self.iter_step)
             self.writer.add_scalar('Statistics/pred_power_mean', pred_power.mean().item(), self.iter_step)
+            self.writer.add_scalar('Statistics/effective_looks', self.effective_looks, self.iter_step)
 
             train_metrics = self.collect_train_metrics(
                 frame_idx,
@@ -407,11 +420,74 @@ class ISARRunner:
         return torch.exp(self.log_image_gain)
 
     def compute_power_noise_loss(self, pred_power, target_power, noise_power):
-        observed = target_power.clamp_min(0.0) / noise_power
-        predicted = pred_power.clamp_min(0.0) / noise_power
-        bessel_arg = 2.0 * torch.sqrt((observed * predicted).clamp_min(0.0))
-        log_i0 = torch.log(torch.special.i0e(bessel_arg) + 1e-8) + bessel_arg
-        return (observed + predicted - log_i0).mean()
+        """Thermal-noise NLL for an incoherently averaged detected-power image.
+
+        The renderer predicts the deterministic noise-free power ``x``. For
+        ``L`` independent detected-power looks with complex Gaussian receiver
+        noise power ``P_n``, the averaged power has
+
+            mean     = x + P_n
+            variance = (P_n^2 + 2 x P_n) / L.
+
+        The exact distribution is multi-look noncentral chi-square. This loss
+        uses its heteroscedastic Gaussian approximation, which is convenient
+        for long integrations and has finite gradients at ``x = 0``.
+        """
+        predicted = pred_power.clamp_min(0.0)
+        observed = target_power.clamp_min(0.0)
+        noise = noise_power.clamp_min(self.noise_likelihood_min)
+        mean_power = predicted + noise
+        variance = (
+            noise.square() + 2.0 * predicted * noise
+        ) / self.effective_looks
+        variance = variance.clamp_min(self.loss_epsilon)
+        residual = observed - mean_power
+        pixel_nll = 0.5 * (torch.log(variance) + residual.square() / variance)
+        return pixel_nll.mean()
+
+    def ensure_finite_tensor(self, name, tensor, frame_idx):
+        if torch.isfinite(tensor).all():
+            return
+        raise FloatingPointError(
+            f'Non-finite {name} at iter={self.iter_step}, frame={int(frame_idx)}'
+        )
+
+    def named_trainable_parameters(self):
+        for name, parameter in self.sdf_network.named_parameters():
+            yield f'sdf_network.{name}', parameter
+        for name, parameter in self.variance_network.named_parameters():
+            yield f'variance_network.{name}', parameter
+        yield 'log_image_gain', self.log_image_gain
+
+    def ensure_finite_gradients(self, frame_idx):
+        invalid = []
+        for name, parameter in self.named_trainable_parameters():
+            gradient = parameter.grad
+            if gradient is not None and not torch.isfinite(gradient).all():
+                invalid.append(name)
+        if invalid:
+            self.optimizer.zero_grad(set_to_none=True)
+            preview = ', '.join(invalid[:5])
+            if len(invalid) > 5:
+                preview += f', ... ({len(invalid)} tensors)'
+            raise FloatingPointError(
+                f'Non-finite gradients at iter={self.iter_step}, '
+                f'frame={int(frame_idx)}: {preview}'
+            )
+
+    def ensure_finite_parameters(self, frame_idx):
+        invalid = [
+            name for name, parameter in self.named_trainable_parameters()
+            if not torch.isfinite(parameter).all()
+        ]
+        if invalid:
+            preview = ', '.join(invalid[:5])
+            if len(invalid) > 5:
+                preview += f', ... ({len(invalid)} tensors)'
+            raise FloatingPointError(
+                f'Non-finite parameters after optimizer step at '
+                f'iter={self.iter_step}, frame={int(frame_idx)}: {preview}'
+            )
 
     def update_learning_rate(self):
         if self.iter_step < self.warm_up_end and self.warm_up_end > 0:
@@ -781,6 +857,9 @@ if __name__ == '__main__':
         except KeyboardInterrupt:
             print('Training interrupted by user.')
             runner.save_final_results(reason='interrupted')
+        except FloatingPointError as error:
+            print(f'Training stopped because of a numerical error: {error}')
+            runner.save_final_results(reason='non_finite')
         else:
             runner.save_final_results(reason='finished')
     elif args.mode == 'validate_image':
