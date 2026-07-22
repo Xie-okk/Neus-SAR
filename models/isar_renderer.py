@@ -140,7 +140,7 @@ class ISARRenderer:
 
         return range_bin, azimuth_bin, range_coord, azimuth_coord
 
-    def render_frame(self, frame_meta, sdf_network, variance_network,
+    def render_frame(self, frame_meta, sdf_network, variance_network, scattering_network,
                      image_shape=None, n_samples=None, cos_anneal_ratio=1.0):
         """
         渲染一帧 ISAR 图像
@@ -159,12 +159,13 @@ class ISARRenderer:
             frame_meta,
             sdf_network,
             variance_network,
+            scattering_network,
             image_shape=image_shape,
             n_samples=n_samples,
             cos_anneal_ratio=cos_anneal_ratio
         )
 
-    def render_frame_neus(self, frame_meta, sdf_network, variance_network,
+    def render_frame_neus(self, frame_meta, sdf_network, variance_network, scattering_network,
                           image_shape=None, n_samples=None, cos_anneal_ratio=1.0):
         device = next(sdf_network.parameters()).device
 
@@ -199,6 +200,7 @@ class ISARRenderer:
                 frame_meta,
                 sdf_network,
                 variance_network,
+                scattering_network,
                 (height, width),
                 cos_anneal_ratio=cos_anneal_ratio
             )
@@ -233,6 +235,7 @@ class ISARRenderer:
             'points': debug_ret.get('points'),
             'gradients': debug_ret.get('gradients'),
             'normals': debug_ret.get('normals'),
+            'scattering_coefficient': debug_ret.get('scattering_coefficient'),
             'scatter': debug_ret.get('scatter'),
             'point_weight': debug_ret.get('point_weight'),
             'range_bin': debug_ret.get('range_bin'),
@@ -246,7 +249,8 @@ class ISARRenderer:
         }
 
     def render_ray_chunk(self, ray_bases, ray_dir, coarse_range_vals, ray_area, frame_meta,
-                         sdf_network, variance_network, image_shape, cos_anneal_ratio=1.0):
+                         sdf_network, variance_network, scattering_network, image_shape,
+                         cos_anneal_ratio=1.0):
         height, width = image_shape
         device = ray_bases.device
         n_rays = ray_bases.shape[0]
@@ -266,6 +270,7 @@ class ISARRenderer:
 
         sdf_output = sdf_network(points_flat)
         sdf = sdf_output[:, :1]
+        feature_vectors = sdf_output[:, 1:]
         d_output = torch.ones_like(sdf, requires_grad=False, device=device)
         gradients = torch.autograd.grad(
             outputs=sdf,
@@ -293,9 +298,20 @@ class ISARRenderer:
         normals = F.normalize(gradients, dim=-1)
         los = _meta_vector(frame_meta, 'radar_los').to(device)
         los = F.normalize(los, dim=0)
-        incidence_cos = torch.clamp(torch.sum(normals * (los)[None, None, :], dim=-1, keepdim=True), min=0.0)
-        scatter = incidence_cos ** 2
-        point_weight = weights * scatter * ray_area
+        scattering_coefficient = scattering_network(
+            points.reshape(-1, 3),
+            normals.reshape(-1, 3),
+            dirs.reshape(-1, 3),
+            feature_vectors
+        ).reshape(n_rays, n_samples, 1)
+        # incidence_cos = torch.clamp(
+        #     torch.sum(normals * los[None, None, :], dim=-1, keepdim=True),
+        #     min=0.0
+        # )
+        # scatter = scattering_coefficient * incidence_cos ** 2
+        scatter = scattering_coefficient
+        point_weight = weights * scatter 
+        # point_weight = weights * scatter * ray_area
 
         points_flat = points.reshape(-1, 3)
         point_weight_flat = point_weight.reshape(-1)
@@ -320,6 +336,7 @@ class ISARRenderer:
             'points': points_flat,
             'gradients': gradients.reshape(-1, 3),
             'normals': normals.reshape(-1, 3),
+            'scattering_coefficient': scattering_coefficient.reshape(-1, 1),
             'scatter': scatter.reshape(-1, 1),
             'point_weight': point_weight.reshape(-1, 1),
             'range_bin': range_bin,
@@ -532,7 +549,7 @@ class ISARRenderer:
 
         return alpha, weights, 1.0 / inv_s
 
-    def render_bins(self, frame_meta, bins, sdf_network, variance_network,
+    def render_bins(self, frame_meta, bins, sdf_network, variance_network, scattering_network,
                     image_shape=None, n_samples=None, cos_anneal_ratio=1.0):
         """
         渲染整幅图像，并提取指定像素位置的渲染值
@@ -543,7 +560,7 @@ class ISARRenderer:
             原 render_frame 的输出字典，附加 'bin_values' 键 (B, 1)
         """
         render_out = self.render_frame(
-            frame_meta, sdf_network, variance_network,
+            frame_meta, sdf_network, variance_network, scattering_network,
             image_shape=image_shape, n_samples=n_samples,
             cos_anneal_ratio=cos_anneal_ratio
         )

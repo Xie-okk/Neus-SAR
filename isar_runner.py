@@ -18,7 +18,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from models.isar_dataset import ISARDataset
-from models.fields import SDFNetwork, SingleVarianceNetwork
+from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork
 from models.isar_renderer import ISARRenderer
 
 warnings.filterwarnings(
@@ -147,8 +147,13 @@ class ISARRunner:
         ).to(self.device)
 
         # 优化器
+        self.scattering_network = RenderingNetwork(
+            **self.conf['model.scattering_network']
+        ).to(self.device)
+
         params_to_train = list(self.sdf_network.parameters()) + \
-                          list(self.variance_network.parameters())
+                          list(self.variance_network.parameters()) + \
+                          list(self.scattering_network.parameters())
         self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
 
         # 渲染器（使用我们最终极简版本）
@@ -225,6 +230,7 @@ class ISARRunner:
                 frame_meta,
                 self.sdf_network,
                 self.variance_network,
+                self.scattering_network,
                 image_shape=target_image.shape,
                 cos_anneal_ratio=cos_anneal_ratio
             )
@@ -449,7 +455,13 @@ class ISARRunner:
         checkpoint = torch.load(path, map_location=self.device)
         self.sdf_network.load_state_dict(checkpoint['sdf_network'])
         self.variance_network.load_state_dict(checkpoint['variance_network'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        has_scattering_network = 'scattering_network' in checkpoint
+        if has_scattering_network:
+            self.scattering_network.load_state_dict(checkpoint['scattering_network'])
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        else:
+            print('Legacy checkpoint has no scattering_network; using a new random '
+                  'scattering network and resetting Adam state.')
         self.iter_step = checkpoint['iter_step']
         logging.info(f'Checkpoint loaded (iter {self.iter_step})')
 
@@ -457,6 +469,7 @@ class ISARRunner:
         checkpoint = {
             'sdf_network': self.sdf_network.state_dict(),
             'variance_network': self.variance_network.state_dict(),
+            'scattering_network': self.scattering_network.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'iter_step': self.iter_step,
         }
@@ -472,6 +485,7 @@ class ISARRunner:
             'lr', 'inv_s', 'cos_anneal_ratio', 'n_height',
             'target_mean', 'target_max', 'pred_mean', 'pred_max',
             'alpha_mean', 'alpha_max', 'weight_mean', 'weight_max',
+            'scattering_coefficient_mean', 'scattering_coefficient_max',
             'point_weight_mean', 'point_weight_max', 'sdf_min', 'sdf_max'
         ]
 
@@ -545,6 +559,7 @@ class ISARRunner:
         pred_image = render_out.get('isar')
         alpha = render_out.get('alpha')
         weights = render_out.get('weights')
+        scattering_coefficient = render_out.get('scattering_coefficient')
         point_weight = render_out.get('point_weight')
         sdf = render_out.get('sdf')
         sdf_min = render_out.get('sdf_min')
@@ -571,6 +586,8 @@ class ISARRunner:
             'alpha_max': self.tensor_stat(alpha, torch.max),
             'weight_mean': self.tensor_stat(weights, torch.mean),
             'weight_max': self.tensor_stat(weights, torch.max),
+            'scattering_coefficient_mean': self.tensor_stat(scattering_coefficient, torch.mean),
+            'scattering_coefficient_max': self.tensor_stat(scattering_coefficient, torch.max),
             'point_weight_mean': self.tensor_stat(point_weight, torch.mean),
             'point_weight_max': self.tensor_stat(point_weight, torch.max),
             'sdf_min': self.tensor_stat(sdf_min, torch.min),
@@ -664,6 +681,7 @@ class ISARRunner:
             frame_meta,
             self.sdf_network,
             self.variance_network,
+            self.scattering_network,
             image_shape=target_image.shape
         )
 
