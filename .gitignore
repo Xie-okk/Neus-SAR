@@ -98,7 +98,6 @@ ENV/
 [Ll]ib
 [Ll]ib64
 [Ll]ocal
-[Ss]cripts
 pyvenv.cfg
 .venv
 pip-selfcheck.json
@@ -151,6 +150,5 @@ crashlytics-build.properties
 fabric.properties
 
 data
-public_data
 exp
 tmp
