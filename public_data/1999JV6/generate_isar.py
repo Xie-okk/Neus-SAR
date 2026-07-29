@@ -75,7 +75,7 @@ def generate_isar_dataset(
     # 自转向量
     c = 299792458.0
     wavelength = c / radar_frequency
-    omega_vec = np.array([0.0, 0.0, 1.0]) * (2.0 * np.pi / rotation_period) # 默认绕 Z 轴
+    omega_vec = np.array([0.0, 0.0, -1.0]) * (2.0 * np.pi / rotation_period) # 默认绕 Z 轴
     
     # 3. 定义 18 个视角 (仰角 45 度 9 张，仰角 -45 度 9 张)
     views = []

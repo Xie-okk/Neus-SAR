@@ -125,12 +125,9 @@ class ISARRunner:
         self.gain_learning_rate = self.conf.get_float('train.gain_learning_rate', default=1e-2)
         self.noise_border_fraction = self.conf.get_float('train.noise_border_fraction', default=0.10)
         self.noise_likelihood_min = self.conf.get_float('train.noise_likelihood_min', default=1e-6)
-        self.effective_looks = self.conf.get_float('train.effective_looks', default=1.0)
-        self.loss_epsilon = self.conf.get_float('train.loss_epsilon', default=1e-8)
-        if self.effective_looks <= 0.0:
-            raise ValueError('train.effective_looks must be positive')
-        if self.loss_epsilon <= 0.0:
-            raise ValueError('train.loss_epsilon must be positive')
+        self.power_loss_beta = self.conf.get_float('train.power_loss_beta', default=0.01)
+        if self.power_loss_beta <= 0.0:
+            raise ValueError('train.power_loss_beta must be positive')
         self.export_init_mesh = self.conf.get_bool('validate.export_init_mesh', default=True)
         self.export_init_image = self.conf.get_bool('validate.export_init_image', default=False)
         self.export_init_sdf = self.conf.get_bool('validate.export_init_sdf', default=True)
@@ -249,7 +246,7 @@ class ISARRunner:
             noise_power = self.frame_noise_power[frame_idx]
             image_gain = self.get_image_gain()
             pred_power = image_gain * pred_image
-            image_loss_raw = self.compute_power_noise_loss(
+            image_loss_raw = self.compute_power_huber_loss(
                 pred_power,
                 target_image,
                 noise_power
@@ -289,7 +286,7 @@ class ISARRunner:
             self.writer.add_scalar('Statistics/noise_power', noise_power.item(), self.iter_step)
             self.writer.add_scalar('Statistics/image_gain', image_gain.item(), self.iter_step)
             self.writer.add_scalar('Statistics/pred_power_mean', pred_power.mean().item(), self.iter_step)
-            self.writer.add_scalar('Statistics/effective_looks', self.effective_looks, self.iter_step)
+            self.writer.add_scalar('Statistics/power_loss_beta', self.power_loss_beta, self.iter_step)
 
             train_metrics = self.collect_train_metrics(
                 frame_idx,
@@ -422,31 +419,23 @@ class ISARRunner:
     def get_image_gain(self):
         return torch.exp(self.log_image_gain)
 
-    def compute_power_noise_loss(self, pred_power, target_power, noise_power):
-        """Thermal-noise NLL for an incoherently averaged detected-power image.
+    def compute_power_huber_loss(self, pred_power, target_power, noise_power):
+        """SmoothL1/Huber loss in the normalized observed-power domain.
 
-        The renderer predicts the deterministic noise-free power ``x``. For
-        ``L`` independent detected-power looks with complex Gaussian receiver
-        noise power ``P_n``, the averaged power has
+        The renderer predicts deterministic noise-free power after global
+        image gain. We still fit the same observation model,
 
-            mean     = x + P_n
-            variance = (P_n^2 + 2 x P_n) / L.
+            Y = g * X + sigma,
 
-        The exact distribution is multi-look noncentral chi-square. This loss
-        uses its heteroscedastic Gaussian approximation, which is convenient
-        for long integrations and has finite gradients at ``x = 0``.
+        but sigma is used only as an additive noise floor. It is not used to
+        form a sigma-dependent variance weight, so low-SNR frames are not
+        automatically given a wider residual tolerance.
         """
         predicted = pred_power.clamp_min(0.0)
         observed = target_power.clamp_min(0.0)
         noise = noise_power.clamp_min(self.noise_likelihood_min)
         mean_power = predicted + noise
-        variance = (
-            noise.square() + 2.0 * predicted * noise
-        ) / self.effective_looks
-        variance = variance.clamp_min(self.loss_epsilon)
-        residual = observed - mean_power
-        pixel_nll = 0.5 * (torch.log(variance) + residual.square() / variance)
-        return pixel_nll.mean()
+        return F.smooth_l1_loss(mean_power, observed, beta=self.power_loss_beta)
 
     def ensure_finite_tensor(self, name, tensor, frame_idx):
         if torch.isfinite(tensor).all():
@@ -590,12 +579,12 @@ class ISARRunner:
     def metric_fieldnames(self):
         return [
             'iter', 'frame_idx', 'loss', 'image_loss', 'eikonal_loss',
-            'image_loss_raw', 'eikonal_loss_raw', 'image_weight', 'igr_weight',
+            'image_loss_raw', 'eikonal_loss_raw', 'image_weight', 'igr_weight', 'power_loss_beta',
             'lr', 'inv_s', 'cos_anneal_ratio', 'n_height',
             'target_mean', 'target_max', 'pred_mean', 'pred_max',
             'noise_power', 'image_gain', 'pred_power_mean', 'pred_power_max',
             'mean_power_mean', 'mean_power_max',
-            'residual_mean', 'residual_abs_mean', 'residual_max',
+            'residual_mean', 'residual_abs_mean', 'residual_rmse', 'residual_max',
             'alpha_mean', 'alpha_max', 'weight_mean', 'weight_max',
             'point_weight_mean', 'point_weight_max', 'sdf_min', 'sdf_max'
         ]
@@ -654,6 +643,7 @@ class ISARRunner:
             'eikonal_loss_raw': float(eikonal_loss_raw.detach().item()),
             'image_weight': float(self.image_weight),
             'igr_weight': float(self.igr_weight),
+            'power_loss_beta': float(self.power_loss_beta),
             'lr': float(self.optimizer.param_groups[0]['lr']),
             'inv_s': float(current_inv_s),
             'cos_anneal_ratio': float(cos_anneal_ratio),
@@ -670,6 +660,7 @@ class ISARRunner:
             'mean_power_max': self.tensor_stat(mean_power, torch.max),
             'residual_mean': self.tensor_stat(residual, torch.mean),
             'residual_abs_mean': self.tensor_stat(torch.abs(residual), torch.mean),
+            'residual_rmse': self.tensor_stat(torch.sqrt(residual.square().mean()), lambda x: x),
             'residual_max': self.tensor_stat(torch.abs(residual), torch.max),
             'alpha_mean': self.tensor_stat(alpha, torch.mean),
             'alpha_max': self.tensor_stat(alpha, torch.max),

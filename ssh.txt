@@ -51,4 +51,5 @@ GPU 0 存在 NVIDIA device-handle 错误；训练优先使用 --gpu 1、--gpu 2 
 本地复制范围不包括：exp文件，.agent,.codex,.vscode,.git，ssh.txt，
 只复制本次需要的代码、配置、脚本和文档，不覆盖远程实验结果。除非明确要求，也不会复制本地 .git/。
 
-本地环境用neus，不要用base
+本地环境用neus，不要用base,
+当上下文每增加20%，压缩一次上下文

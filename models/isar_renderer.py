@@ -32,22 +32,22 @@ def _meta_vector(frame_meta, key):
 
 class ISARRenderer:
     """
-    极简可微非相干 ISAR 渲染器
-    · 自转轴固定为 Z 轴
-    · 按最大值归一化，便于和归一化 ISAR 图监督
+    极简可微非相�?ISAR 渲染�?
+    · 自转轴固定为 Z �?
+    · 按最大值归一化，便于和归一�?ISAR 图监�?
     """
 
     def __init__(self,
-                 bound=1.0,               # 3D 采样空间范围：[-bound, bound]³ 米
-                 splat_mode=2,             # 1=最近邻, 2=双线性, 3=双线性+PSF
+                 bound=1.0,               # 3D 采样空间范围：[-bound, bound]³ �?
+                 splat_mode=2,             # 1=最近邻, 2=双线�? 3=双线�?PSF
                  psf_lobes=1,              # 1=主瓣, 2=主瓣+第一旁瓣, 3=主瓣+第一/第二旁瓣
-                 coord_scale=25.0,         # 投影时归一化坐标 -> 物理米制坐标的比例
+                 coord_scale=25.0,         # 投影时归一化坐�?-> 物理米制坐标的比�?
                  n_azimuth=None,           # None 时取图像宽度 W
                  n_range=None,             # coarse 距离向采样数，None 时取图像高度 H
-                 n_importance=0,            # NeuS up-sampling 追加的 fine 距离向采样数
-                 up_sample_steps=1,         # fine 采样分几轮加入
-                 n_height=None,            # None 时取 W，表示 ISAR 投影丢掉的第三维采样数
-                 ray_chunk=4096):          # 按 ray 分块，降低一次性 SDF/梯度显存峰值 1024
+                 n_importance=0,            # NeuS up-sampling 追加�?fine 距离向采样数
+                 up_sample_steps=1,         # fine 采样分几轮加�?
+                 n_height=None,            # None 时取 W，表�?ISAR 投影丢掉的第三维采样�?
+                 ray_chunk=4096):          # �?ray 分块，降低一次�?SDF/梯度显存峰�?1024
         self.bound = float(bound)
         self.splat_mode = int(splat_mode)
         self.psf_lobes = int(psf_lobes)
@@ -60,7 +60,7 @@ class ISARRenderer:
         self.ray_chunk = int(ray_chunk)
 
         # 自转轴固定为 Z 轴（单位向量），不需要角速度大小
-        self.rot_axis = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
+        self.rot_axis = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
         self.rot_axis = F.normalize(self.rot_axis, dim=0)
 
         if self.bound <= 0.0:
@@ -83,41 +83,41 @@ class ISARRenderer:
 
     def project_points(self, points, frame_meta):
         """
-        将 3D 采样点投影到距离-方位向图像平面（物理坐标→像素索引）
+        �?3D 采样点投影到距离-方位向图像平面（物理坐标→像素索引）
 
         参数:
-            points: (N, 3) 采样点坐标
-            frame_meta: 元数据字典，必须包含：
-                'radar_los'    : 3 维向量，视线方向（目标→雷达）
-                'range_axis'   : 1D 张量，距离轴各像素中心的物理坐标（米）
-                'azimuth_axis' : 1D 张量，方位轴各像素中心的物理坐标（米）
+            points: (N, 3) 采样点坐�?
+            frame_meta: 元数据字典，必须包含�?
+                'radar_los'    : 3 维向量，视线方向（目标→雷达�?
+                'range_axis'   : 1D 张量，距离轴各像素中心的物理坐标（米�?
+                'azimuth_axis' : 1D 张量，方位轴各像素中心的物理坐标（米�?
 
         返回:
-            range_bin    : (N,) 距离向浮点像素索引
-            azimuth_bin  : (N,) 方位向浮点像素索引
-            range_coord  : (N,) 物理距离坐标（米）
-            azimuth_coord: (N,) 物理方位坐标（米）
+            range_bin    : (N,) 距离向浮点像素索�?
+            azimuth_bin  : (N,) 方位向浮点像素索�?
+            range_coord  : (N,) 物理距离坐标（米�?
+            azimuth_coord: (N,) 物理方位坐标（米�?
         """
         device = points.device
         points_phys = points * self.coord_scale
 
-        # ---- 视线方向（目标→雷达），归一化 ----
+        # ---- 视线方向（目标→雷达），归一�?----
         los = _meta_vector(frame_meta, 'radar_los').to(device)
         los = F.normalize(los, dim=0)
 
         # ---- 自转轴（Z 轴）----
         z_axis = self.rot_axis.to(device)
 
-        # ===== 距离向坐标 =====
-        # 距离 = 点在视线方向上的投影（米）
+        # ===== 距离向坐�?=====
+        # 距离 = 点在视线方向上的投影（米�?
         range_coord = -torch.sum(points_phys * los, dim=-1)
 
-        # ===== 方位向坐标 =====
-        # 标准 ISAR 方位向物理公式（已消去角速度和波长）：
+        # ===== 方位向坐�?=====
+        # 标准 ISAR 方位向物理公式（已消去角速度和波长）�?
         #   x = ((z × p) · los) / ||z × los||
         # 单位：米
         z_cross_los = torch.cross(los,z_axis,  dim=0)    # 视线与自转轴张成平面的法向量
-        norm_cross = torch.norm(z_cross_los) + 1e-8       # 防止平行时除零
+        norm_cross = torch.norm(z_cross_los) + 1e-8       # 防止平行时除�?
         z_cross_los = z_cross_los / norm_cross
         azimuth_coord = torch.sum(points_phys *z_cross_los, dim=-1)
 
@@ -126,15 +126,15 @@ class ISARRenderer:
         azimuth_axis = frame_meta['azimuth_axis'].to(device)
         height, width = range_axis.shape[0], azimuth_axis.shape[0]
 
-        # 假设坐标轴均匀，网格间距 = 相邻像素中心的差值
-        range_spacing = range_axis[1] - range_axis[0]        # 米/像素
-        azimuth_spacing = azimuth_axis[1] - azimuth_axis[0]  # 米/像素
+        # 假设坐标轴均匀，网格间�?= 相邻像素中心的差�?
+        range_spacing = range_axis[1] - range_axis[0]        # �?像素
+        azimuth_spacing = azimuth_axis[1] - azimuth_axis[0]  # �?像素
 
-        # 第 0 个像素中心对应的物理坐标
+        # �?0 个像素中心对应的物理坐标
         range_origin = range_axis[0]
         azimuth_origin = azimuth_axis[0]
 
-        # 物理坐标 → 浮点像素索引（0 基准）
+        # 物理坐标 �?浮点像素索引�? 基准�?
         range_bin = (range_coord - range_origin) / range_spacing
         azimuth_bin = (azimuth_coord - azimuth_origin) / azimuth_spacing
 
@@ -143,14 +143,14 @@ class ISARRenderer:
     def render_frame(self, frame_meta, sdf_network, variance_network,
                      image_shape=None, n_samples=None, cos_anneal_ratio=1.0):
         """
-        渲染一帧 ISAR 图像
+        渲染一�?ISAR 图像
 
         参数:
-            frame_meta        : 当前帧的元数据
-            sdf_network       : SDF 网络，输出 SDF 值 + 特征
+            frame_meta        : 当前帧的元数�?
+            sdf_network       : SDF 网络，输�?SDF �?+ 特征
             variance_network : 全局方差网络 (输出标量 s)
             image_shape       : 输出图像 (H, W)，默认从 frame_meta 读取
-            n_samples         : 总采样点数，默认使用构造函数中的值
+            n_samples         : 总采样点数，默认使用构造函数中的�?
 
         返回:
             字典，包含渲染图像及中间变量（用于损失计算和可视化）
@@ -226,7 +226,7 @@ class ISARRenderer:
         gradient_error = gradient_error_sum / (gradient_error_count + 1e-5)
 
         return {
-            'isar': image,                 # 渲染的 ISAR 图像 (H, W)
+            'isar': image,                 # 渲染�?ISAR 图像 (H, W)
             'sdf': debug_ret.get('sdf'),
             'sdf_min': sdf_min,
             'sdf_max': sdf_max,
@@ -309,7 +309,7 @@ class ISARRenderer:
             raise ValueError('Unsupported splat_mode: {}'.format(self.splat_mode))
 
         gradient_error = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
-        # 原版 NeuS 只在 relaxed unit sphere 内施加 Eikonal 约束，避免远离物体的空区主导正则项。
+        # 原版 NeuS 只在 relaxed unit sphere 内施�?Eikonal 约束，避免远离物体的空区主导正则项�?
         relax_inside_sphere = (torch.linalg.norm(points, ord=2, dim=-1) < 1.2).float().detach()
 
         return {
@@ -535,12 +535,12 @@ class ISARRenderer:
     def render_bins(self, frame_meta, bins, sdf_network, variance_network,
                     image_shape=None, n_samples=None, cos_anneal_ratio=1.0):
         """
-        渲染整幅图像，并提取指定像素位置的渲染值
+        渲染整幅图像，并提取指定像素位置的渲染�?
 
         参数:
             bins: (B, 2) 采样像素坐标 [range_idx, azimuth_idx]
         返回:
-            原 render_frame 的输出字典，附加 'bin_values' 键 (B, 1)
+            �?render_frame 的输出字典，附加 'bin_values' �?(B, 1)
         """
         render_out = self.render_frame(
             frame_meta, sdf_network, variance_network,
@@ -555,12 +555,12 @@ class ISARRenderer:
 
     def _sinc_sq(self, dx, sigma):
         """
-        计算归一化 sinc² 函数值：sinc²( dx / sigma )
+        计算归一�?sinc² 函数值：sinc²( dx / sigma )
         其中 sinc(x) = sin(πx) / (πx)
-        sigma 控制主瓣宽度（约 2*sigma 像素）
+        sigma 控制主瓣宽度（约 2*sigma 像素�?
         """
         pi_x = math.pi * (dx / sigma)
-        # 零点附近用 1 避免除零
+        # 零点附近�?1 避免除零
         sinc = torch.where(pi_x.abs() < 1e-5,
                            torch.ones_like(pi_x),
                            torch.sin(pi_x) / pi_x)
@@ -634,12 +634,12 @@ class ISARRenderer:
 
     def extract_geometry(self, sdf_network, bound_min, bound_max, resolution, threshold=0.0):
         """
-        从 SDF 网络中提取等值面网格（用于最终可视化）
+        �?SDF 网络中提取等值面网格（用于最终可视化�?
 
         参数:
             bound_min/max : 查询空间范围
-            resolution    : 网格分辨率
-            threshold     : 等值面阈值(0 对应表面)
+            resolution    : 网格分辨�?
+            threshold     : 等值面阈�?0 对应表面)
 
         返回:
             mesh (顶点和面)
